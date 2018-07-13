@@ -16,9 +16,10 @@ extra-source-files:  ChangeLog.md
 cabal-version:       >=1.10
 
 library
-  exposed-modules: Compiler
+  exposed-modules: Test Compiler Interpreter
   -- other-modules:
   -- other-extensions:
-  build-depends:       base >=4.10 && <4.11, scanner, bytestring
+  build-depends:       base >=4.10 && <4.11, scanner, bytestring, template-haskell
+                       , th-lift-instances, file-embed
   hs-source-dirs:      src
   default-language:    Haskell2010
