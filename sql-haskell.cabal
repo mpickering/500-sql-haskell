@@ -16,7 +16,7 @@ extra-source-files:  ChangeLog.md
 cabal-version:       >=1.10
 
 library
-  exposed-modules: Test Compiler Interpreter
+  exposed-modules: Test Compiler Interpreter LMS
   -- other-modules:
   -- other-extensions:
   build-depends:       base >=4.10 && <4.11, scanner, bytestring, template-haskell
