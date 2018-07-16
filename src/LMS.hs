@@ -22,11 +22,39 @@ class Ops r where
   eq :: Eq a => r a -> r a -> r Bool
   neq :: Eq a => r a -> r a -> r Bool
   bc_split :: r Char -> r ByteString -> r [ByteString]
+  tail_dropwhile :: Char -> r ByteString -> r ByteString
+  take_while :: Char -> r ByteString -> r ByteString
+  _show :: Show a => r a -> r String
+  _if :: r Bool -> r a -> r a -> r a
+  _caseString :: r ByteString -> r a -> r a -> r a
+  _fix :: (r a -> r a) -> r a
+  _lam :: (r a -> r b) -> r (a -> b)
+  (+++) :: r String -> r String -> r String
+  pure :: Lift a => a -> r a
+  (<*>) :: r (a -> b) -> r a -> r b
+
+infixl 4 <*>
+
 
 instance Ops Code where
   eq (Code e1) (Code e2) = Code [|| $$e1 == $$e2 ||]
   neq (Code e1) (Code e2) = Code [|| $$e1 /= $$e2 ||]
   bc_split (Code e1) (Code e2) = Code [|| BC.split $$e1 $$e2 ||]
+  _show (Code a) = Code [|| show $$a ||]
+  _if (Code a) (Code b) (Code c) = Code [|| if $$a then $$b else $$c ||]
+  _caseString (Code a) (Code b) (Code c) =
+    Code [|| case $$a of
+                "" -> $$b
+                _  -> $$c ||]
+  (+++) (Code a) (Code b) = Code [|| $$a ++ $$b ||]
+  tail_dropwhile c (Code b) = Code [|| BC.tail (BC.dropWhile (/= c) $$b) ||]
+  take_while c (Code b) = Code [|| BC.takeWhile (/= c) $$b ||]
+  _fix f = Code [|| fix (\a -> $$(runCode $ f (Code [||a||]))) ||]
+
+  _lam f = Code $ [|| \a ->  $$(runCode $ f (Code [|| a ||]))  ||]
+
+  pure = Code . unsafeTExpCoerce . lift
+  (Code f) <*> (Code a) = Code [|| $$f $$a ||]
 
 newtype Code a = Code (Q (TExp a))
 
@@ -34,12 +62,6 @@ runCode :: Code a -> Q (TExp a)
 runCode (Code a) = a
 
 
-pure :: Lift a => a -> Code a
-pure = Code . unsafeTExpCoerce . lift
-
-infixl 4 <*>
-(<*>) :: Code (a -> b) -> Code a -> Code b
-(Code f) <*> (Code a) = Code [|| $$f $$a ||]
 
 type Fields = [QTExp ByteString]
 type Schema = [ByteString]
@@ -70,46 +92,42 @@ type QTExp a = Code a
 fix :: (a -> a) -> a
 fix f = let x = f x in x
 
-parseRow' :: Schema -> QTExp ByteString -> QTExp ByteString
-parseRow' [] b = b
-parseRow' [n] (Code b) = Code [|| (BC.tail (BC.dropWhile (/= '\n') $$b)) ||]
-parseRow' (_:ss) (Code b) = parseRow' ss (Code [||  (BC.tail (BC.dropWhile (/= ',') $$b)) ||])
-
+parseRow' :: Schema -> QTExp (ByteString -> ByteString)
+parseRow' [] = _lam id
+parseRow' [n] = _lam (\bs -> tail_dropwhile '\n' bs)
+parseRow' (_:ss) = _lam (\bs -> parseRow' ss <*> tail_dropwhile ',' bs)
 
 processCSV :: Schema -> Code ByteString -> (Record -> Code String) -> Code String
-processCSV ss (Code bs) yld =
-  Code [|| $$(runCode $ rows ss) $$bs ||]
+processCSV ss bs yld =
+  rows ss <*> bs
   where
     rows :: Schema -> QTExp (ByteString -> String)
     rows schema = do
-      Code [||
-        fix (\r rs ->
-          case rs of
-            "" -> ""
-            _ ->
-              $$(let (_, fields) = parseRow schema (Code [||rs||])
-                     head = yld (Record fields schema)
-                 in runCode head) ++ r $$(runCode $ parseRow' schema (Code [||rs||])) )||]
+        _fix (\r -> _lam (\rs ->
+          _caseString rs (pure "")
+                ((let (_, fields) = parseRow schema rs
+                      head = yld (Record fields schema)
+                 in head) +++ (r <*>) (parseRow' schema <*> rs) )))
 
 
     parseRow :: Schema -> QTExp ByteString -> (QTExp ByteString, [QTExp ByteString])
     parseRow [] b = (b, [])
-    parseRow [n] (Code b) =
-      (Code [|| let res = BC.dropWhile (/= '\n') $$b in BC.tail res ||]
-      , [Code [|| BC.takeWhile (/= '\n') $$b ||]])
+    parseRow [n] b =
+      ( tail_dropwhile ',' b
+      , [take_while '\n' b])
 
-    parseRow (_:ss) (Code b) =
-      let new = Code [|| let res = BC.dropWhile (/= ',') $$b in BC.tail res ||]
+    parseRow (_:ss) b =
+      let new = tail_dropwhile ',' b
           (final, rs) = parseRow ss new
-      in (final, Code [|| BC.takeWhile (/= ',') $$b ||] : rs)
+      in (final, take_while ',' b : rs)
 
 
 
 printFields :: Fields -> QTExp String
-printFields [] = Code [|| "\n" ||]
-printFields [Code x] = Code [|| show $$x ++ "\n" ||]
-printFields ((Code x):xs) =
-  Code [|| show $$x ++ $$(runCode $ printFields xs) ||]
+printFields [] = pure "\n"
+printFields [x] = _show x +++ pure "\n"
+printFields (x:xs) =
+  _show x +++ printFields xs
 
 evalPred :: Predicate -> Record -> Code Bool
 evalPred  pred rec =
@@ -118,13 +136,40 @@ evalPred  pred rec =
     Ne a b -> neq (evalRef a rec) (evalRef b rec)
 
 evalRef :: Ref -> Record -> Code ByteString
-evalRef (Value a) _ = Code [|| a ||]
-evalRef (Field name) r = (getField name r)
+evalRef (Value a) _ = pure a
+evalRef (Field name) r = getField name r
 
 
 restrict :: Record -> Schema -> Schema -> Record
 restrict r newSchema parentSchema =
   Record (map (flip getField r) parentSchema) newSchema
+
+
+execOp :: Operator -> (Record -> Code String) -> Code String
+execOp op yld = traceShow ("execOp", op) $
+  case op of
+    Scan file schema ->
+      processCSV schema (embedFileT file) yld
+    Print p       -> execOp p (printFields . fields)
+    Filter pred parent -> execOp parent
+      (\rec -> _if (evalPred pred rec) (yld rec) (pure "") )
+    Project newSchema parentSchema parent ->
+      execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
+    Join left right ->
+      execOp left (\rec -> execOp right (\rec' ->
+        let keys = schema rec `intersect` schema rec'
+        in yld (Record (fields rec ++ fields rec')
+                       (schema rec ++ schema rec'))))
+
+runQuery :: Operator -> Q (TExp String)
+runQuery q = runCode $ execOp (Print q) (\_ -> pure "")
+
+test = do
+--  processCSV "data/test.csv" (print . getField "name")
+  expr <- runQ $ unTypeQ  $ runCode $ execOp (Print query) (\_ -> Code [|| "" ||])
+--  expr <- runQ $ unTypeQ  $ power
+  putStrLn $ pprint expr
+
 
 embedFileT :: FilePath -> QTExp ByteString
 embedFileT = Code . unsafeTExpCoerce . embedFile
@@ -140,29 +185,4 @@ bsToExp bs = do
 
 stringToBs :: String -> B.ByteString
 stringToBs = BC.pack
-
-execOp :: Operator -> (Record -> Code String) -> Code String
-execOp op yld = traceShow ("execOp", op) $
-  case op of
-    Scan file schema ->
-      processCSV schema (embedFileT file) yld
-    Print p       -> execOp p (printFields . fields)
-    Filter pred parent -> execOp parent
-      (\rec -> Code [|| if $$(runCode $ evalPred pred rec) then $$(runCode $ yld rec) else "" ||] )
-    Project newSchema parentSchema parent -> execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
-    Join left right ->
-      execOp left (\rec -> execOp right (\rec' ->
-        let keys = schema rec `intersect` schema rec'
-        in yld (Record (fields rec ++ fields rec')
-                       (schema rec ++ schema rec'))))
-
-runQuery :: Operator -> Q (TExp String)
-runQuery q = runCode $ execOp (Print q) (\_ -> Code [|| "" ||])
-
-test = do
---  processCSV "data/test.csv" (print . getField "name")
-  expr <- runQ $ unTypeQ  $ runCode $ execOp (Print query) (\_ -> Code [|| "" ||])
---  expr <- runQ $ unTypeQ  $ power
-  putStrLn $ pprint expr
-
 
