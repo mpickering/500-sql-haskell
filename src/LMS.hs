@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module LMS where
 
 import qualified Data.ByteString as B
@@ -30,6 +31,9 @@ class Ops r where
   _fix :: (r a -> r a) -> r a
   _lam :: (r a -> r b) -> r (a -> b)
   (+++) :: r String -> r String -> r String
+
+
+  _embedFile :: FilePath -> r ByteString
   pure :: Lift a => a -> r a
   (<*>) :: r (a -> b) -> r a -> r b
 
@@ -53,6 +57,8 @@ instance Ops Code where
 
   _lam f = Code $ [|| \a ->  $$(runCode $ f (Code [|| a ||]))  ||]
 
+  _embedFile = embedFileT
+
   pure = Code . unsafeTExpCoerce . lift
   (Code f) <*> (Code a) = Code [|| $$f $$a ||]
 
@@ -63,13 +69,13 @@ runCode (Code a) = a
 
 
 
-type Fields = [QTExp ByteString]
+type Fields r = [r ByteString]
 type Schema = [ByteString]
 type Table = FilePath
 
-data Record = Record { fields :: Fields, schema :: Schema }
+data Record r = Record { fields :: Fields r, schema :: Schema }
 
-getField :: ByteString -> Record -> QTExp ByteString
+getField :: Ops r => ByteString -> Record r -> r ByteString
 getField field (Record fs sch) =
   let i = fromJust (elemIndex field sch)
   in  (fs !! i)
@@ -92,16 +98,16 @@ type QTExp a = Code a
 fix :: (a -> a) -> a
 fix f = let x = f x in x
 
-parseRow' :: Schema -> QTExp (ByteString -> ByteString)
+parseRow' :: Ops r => Schema -> r (ByteString -> ByteString)
 parseRow' [] = _lam id
 parseRow' [n] = _lam (\bs -> tail_dropwhile '\n' bs)
 parseRow' (_:ss) = _lam (\bs -> parseRow' ss <*> tail_dropwhile ',' bs)
 
-processCSV :: Schema -> Code ByteString -> (Record -> Code String) -> Code String
+processCSV :: forall r . Ops r => Schema -> r ByteString -> (Record r -> r String) -> r String
 processCSV ss bs yld =
   rows ss <*> bs
   where
-    rows :: Schema -> QTExp (ByteString -> String)
+    rows :: Ops r => Schema -> r (ByteString -> String)
     rows schema = do
         _fix (\r -> _lam (\rs ->
           _caseString rs (pure "")
@@ -110,7 +116,7 @@ processCSV ss bs yld =
                  in head) +++ (r <*>) (parseRow' schema <*> rs) )))
 
 
-    parseRow :: Schema -> QTExp ByteString -> (QTExp ByteString, [QTExp ByteString])
+    parseRow :: Ops r => Schema -> r ByteString -> (r ByteString, [r ByteString])
     parseRow [] b = (b, [])
     parseRow [n] b =
       ( tail_dropwhile ',' b
@@ -123,33 +129,33 @@ processCSV ss bs yld =
 
 
 
-printFields :: Fields -> QTExp String
+printFields :: Ops r => Fields r -> r String
 printFields [] = pure "\n"
 printFields [x] = _show x +++ pure "\n"
 printFields (x:xs) =
   _show x +++ printFields xs
 
-evalPred :: Predicate -> Record -> Code Bool
+evalPred :: Ops r => Predicate -> Record r -> r Bool
 evalPred  pred rec =
   case pred of
     Eq a b -> eq (evalRef a rec) (evalRef b rec)
     Ne a b -> neq (evalRef a rec) (evalRef b rec)
 
-evalRef :: Ref -> Record -> Code ByteString
+evalRef :: Ops r => Ref -> Record r -> r ByteString
 evalRef (Value a) _ = pure a
 evalRef (Field name) r = getField name r
 
 
-restrict :: Record -> Schema -> Schema -> Record
+restrict :: Ops r => Record r -> Schema -> Schema -> Record r
 restrict r newSchema parentSchema =
   Record (map (flip getField r) parentSchema) newSchema
 
 
-execOp :: Operator -> (Record -> Code String) -> Code String
+execOp :: Ops r => Operator -> (Record r -> r String) -> r String
 execOp op yld = traceShow ("execOp", op) $
   case op of
     Scan file schema ->
-      processCSV schema (embedFileT file) yld
+      processCSV schema (_embedFile file) yld
     Print p       -> execOp p (printFields . fields)
     Filter pred parent -> execOp parent
       (\rec -> _if (evalPred pred rec) (yld rec) (pure "") )
@@ -171,7 +177,7 @@ test = do
   putStrLn $ pprint expr
 
 
-embedFileT :: FilePath -> QTExp ByteString
+embedFileT :: FilePath -> Code ByteString
 embedFileT = Code . unsafeTExpCoerce . embedFile
 
 embedFile :: FilePath -> Q Exp
