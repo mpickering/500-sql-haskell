@@ -18,6 +18,9 @@ import Prelude hiding (Applicative(..))
 import Instances.TH.Lift
 --import Data.FileEmbed
 import Debug.Trace
+import Data.Functor.Identity
+import Control.Applicative (liftA2)
+import System.IO.Unsafe
 
 class Ops r where
   eq :: Eq a => r a -> r a -> r Bool
@@ -39,6 +42,7 @@ class Ops r where
 
 infixl 4 <*>
 
+newtype Code a = Code (Q (TExp a))
 
 instance Ops Code where
   eq (Code e1) (Code e2) = Code [|| $$e1 == $$e2 ||]
@@ -62,7 +66,30 @@ instance Ops Code where
   pure = Code . unsafeTExpCoerce . lift
   (Code f) <*> (Code a) = Code [|| $$f $$a ||]
 
-newtype Code a = Code (Q (TExp a))
+
+instance Ops Identity where
+  eq = liftA2 (==)
+  neq = liftA2 (/=)
+  bc_split = liftA2 (BC.split)
+  tail_dropwhile c = fmap (BC.tail . (BC.dropWhile (/= c)))
+  take_while c = fmap (BC.takeWhile (/= c))
+  _show = fmap show
+  _if (Identity b) (Identity c1) (Identity c2) = Identity (if b then c1 else c2)
+  _caseString (Identity b) (Identity c1) (Identity c2) =
+    Identity (case b of
+                "" -> c1
+                _  -> c2)
+  _fix = fix
+  _lam f = Identity (\a -> runIdentity (f (Identity a)))
+  (+++) = liftA2 (++)
+
+
+  _embedFile = Identity . unsafePerformIO . BC.readFile
+
+  pure = Identity
+  (<*>) (Identity a1) (Identity a2) = Identity (a1 a2)
+
+
 
 runCode :: Code a -> Q (TExp a)
 runCode (Code a) = a
@@ -152,7 +179,7 @@ restrict r newSchema parentSchema =
 
 
 execOp :: Ops r => Operator -> (Record r -> r String) -> r String
-execOp op yld = traceShow ("execOp", op) $
+execOp op yld =
   case op of
     Scan file schema ->
       processCSV schema (_embedFile file) yld
@@ -169,6 +196,8 @@ execOp op yld = traceShow ("execOp", op) $
 
 runQuery :: Operator -> Q (TExp String)
 runQuery q = runCode $ execOp (Print q) (\_ -> pure "")
+
+runQueryUnstaged q = runIdentity (execOp (Print q) (\_ -> ""))
 
 test = do
 --  processCSV "data/test.csv" (print . getField "name")
