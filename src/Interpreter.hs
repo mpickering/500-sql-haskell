@@ -64,9 +64,12 @@ getField field (Record fs sch) =
   let i = fromJust (elemIndex field sch)
   in fs !! i
 
+getFields :: [ByteString] -> Record -> [ByteString]
+getFields fs r = map (flip getField r) fs
+
 restrict :: Record -> [ByteString] -> [ByteString] -> Record
 restrict r newSchema parentSchema =
-  Record (map (flip getField r) parentSchema) newSchema
+  Record (getFields parentSchema r) newSchema
 
 execOp :: Operator -> (Record -> IO ()) -> IO ()
 execOp op yld =
@@ -78,9 +81,9 @@ execOp op yld =
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'
-        -- TODO: Fix this
-        in yld (Record (fields rec ++ fields rec')
-                       (schema rec ++ schema rec'))))
+        in when (getFields keys rec == getFields keys rec')
+            (yld (Record (fields rec ++ fields rec')
+                       (schema rec ++ schema rec')))))
 
 main :: IO ()
 main = do
