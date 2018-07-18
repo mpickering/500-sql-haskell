@@ -25,12 +25,15 @@ class Ops r where
   bc_split :: r Char -> r ByteString -> r [ByteString]
   tail_dropwhile :: Char -> r ByteString -> r ByteString
   take_while :: Char -> r ByteString -> r ByteString
-  _show :: Show a => r a -> r String
   _if :: r Bool -> r a -> r a -> r a
   _caseString :: r ByteString -> r a -> r a -> r a
   _fix :: (r a -> r a) -> r a
   _lam :: (r a -> r b) -> r (a -> b)
-  (+++) :: r String -> r String -> r String
+
+  _print :: Show a => r a -> r Res
+  _putStr :: r ByteString -> r Res
+  (>>>) :: r Res -> r Res -> r Res
+  _empty :: r Res
 
 
   _embedFile :: FilePath -> r ByteString
@@ -45,13 +48,19 @@ instance Ops Code where
   eq (Code e1) (Code e2) = Code [|| $$e1 == $$e2 ||]
   neq (Code e1) (Code e2) = Code [|| $$e1 /= $$e2 ||]
   bc_split (Code e1) (Code e2) = Code [|| BC.split $$e1 $$e2 ||]
-  _show (Code a) = Code [|| show $$a ||]
+  --_show (Code a) = Code [|| show $$a ||]
   _if (Code a) (Code b) (Code c) = Code [|| if $$a then $$b else $$c ||]
   _caseString (Code a) (Code b) (Code c) =
     Code [|| case $$a of
                 "" -> $$b
                 _  -> $$c ||]
-  (+++) (Code a) (Code b) = Code [|| $$a ++ $$b ||]
+  --(+++) (Code a) (Code b) = Code [|| $$a ++ $$b ||]
+  (>>>) (Code a) (Code b) = Code [|| $$a >> $$b ||]
+  _empty = Code [|| return () ||]
+
+  _print (Code a) = Code [|| print $$a ||]
+  _putStr (Code a) = Code [|| BC.putStr $$a ||]
+
   tail_dropwhile c (Code b) = Code [|| BC.tail (BC.dropWhile (/= c) $$b) ||]
   take_while c (Code b) = Code [|| BC.takeWhile (/= c) $$b ||]
   _fix f = Code [|| fix (\a -> $$(runCode $ f (Code [||a||]))) ||]
@@ -70,7 +79,9 @@ instance Ops Identity where
   bc_split = liftA2 (BC.split)
   tail_dropwhile c = fmap (BC.tail . (BC.dropWhile (/= c)))
   take_while c = fmap (BC.takeWhile (/= c))
-  _show = fmap show
+  _print = fmap print
+  _putStr = fmap (BC.putStr)
+  _empty = Identity (return ())
   _if (Identity b) (Identity c1) (Identity c2) = Identity (if b then c1 else c2)
   _caseString (Identity b) (Identity c1) (Identity c2) =
     Identity (case b of
@@ -78,7 +89,7 @@ instance Ops Identity where
                 _  -> c2)
   _fix = fix
   _lam f = Identity (\a -> runIdentity (f (Identity a)))
-  (+++) = liftA2 (++)
+  (>>>) = liftA2 (>>)
 
 
   _embedFile = Identity . unsafePerformIO . BC.readFile
@@ -96,6 +107,8 @@ runCode (Code a) = a
 type Fields r = [r ByteString]
 type Schema = [ByteString]
 type Table = FilePath
+
+type Res = IO ()
 
 data Record r = Record { fields :: Fields r, schema :: Schema }
 
@@ -128,17 +141,17 @@ parseRow' [] = _lam id
 parseRow' [_] = _lam (\bs -> tail_dropwhile '\n' bs)
 parseRow' (_:ss) = _lam (\bs -> parseRow' ss <*> tail_dropwhile ',' bs)
 
-processCSV :: forall r . Ops r => Schema -> r ByteString -> (Record r -> r String) -> r String
+processCSV :: forall r . Ops r => Schema -> r ByteString -> (Record r -> r Res) -> r Res
 processCSV ss bs yld =
   rows ss <*> bs
   where
-    rows :: Ops r => Schema -> r (ByteString -> String)
+    rows :: Ops r => Schema -> r (ByteString -> Res)
     rows sch = do
         _fix (\r -> _lam (\rs ->
-          _caseString rs (pure "")
+          _caseString rs _empty
                 ((let (_, fs) = parseRow sch rs
                   in yld (Record fs sch)
-                  ) +++ (r <*>) (parseRow' sch <*> rs) )))
+                  ) >>> (r <*>) (parseRow' sch <*> rs) )))
 
 
     parseRow :: Ops r => Schema -> r ByteString -> (r ByteString, [r ByteString])
@@ -154,11 +167,11 @@ processCSV ss bs yld =
 
 
 
-printFields :: Ops r => Fields r -> r String
-printFields [] = pure "\n"
-printFields [x] = _show x +++ pure "\n"
+printFields :: Ops r => Fields r -> r Res
+printFields [] = _empty
+printFields [x] = _print x
 printFields (x:xs) =
-  _show x +++ printFields xs
+  _putStr x >>> printFields xs
 
 evalPred :: Ops r => Predicate -> Record r -> r Bool
 evalPred  predicate rec =
@@ -176,14 +189,14 @@ restrict r newSchema parentSchema =
   Record (map (flip getField r) parentSchema) newSchema
 
 
-execOp :: Ops r => Operator -> (Record r -> r String) -> r String
+execOp :: Ops r => Operator -> (Record r -> r Res) -> r Res
 execOp op yld =
   case op of
     Scan file sch ->
       processCSV sch (_embedFile file) yld
     Print p       -> execOp p (printFields . fields)
     Filter predicate parent -> execOp parent
-      (\rec -> _if (evalPred predicate rec) (yld rec) (pure "") )
+      (\rec -> _if (evalPred predicate rec) (yld rec) _empty )
     Project newSchema parentSchema parent ->
       execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
     Join left right ->
@@ -193,16 +206,16 @@ execOp op yld =
         in yld (Record (fields rec ++ fields rec')
                        (schema rec ++ schema rec'))))
 
-runQuery :: Operator -> Q (TExp String)
-runQuery q = runCode $ execOp (Print q) (\_ -> pure "")
+runQuery :: Operator -> Q (TExp Res)
+runQuery q = runCode $ execOp (Print q) (\_ -> _empty )
 
-runQueryUnstaged :: Operator -> String
-runQueryUnstaged q = runIdentity (execOp (Print q) (\_ -> ""))
+runQueryUnstaged :: Operator -> Res
+runQueryUnstaged q = runIdentity (execOp (Print q) (\_ -> _empty) )
 
 test :: IO ()
 test = do
 --  processCSV "data/test.csv" (print . getField "name")
-  expr <- runQ $ unTypeQ  $ runCode $ execOp (Print query) (\_ -> Code [|| "" ||])
+  expr <- runQ $ unTypeQ  $ runCode $ execOp (Print query) (\_ -> _empty )
 --  expr <- runQ $ unTypeQ  $ power
   putStrLn $ pprint expr
 

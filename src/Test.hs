@@ -10,9 +10,9 @@ main = do
   ($$(runQuery query))
   ($$(runQuery query2))
 
-  putStrLn ($$(L.runQuery L.query))
-  putStrLn ($$(L.runQuery L.query2))
+  ($$(L.runQuery L.query))
+  ($$(L.runQuery L.query2))
 
-  putStrLn (L.runQueryUnstaged L.query)
-  putStrLn (L.runQueryUnstaged L.query2)
+  (L.runQueryUnstaged L.query)
+  (L.runQueryUnstaged L.query2)
 
