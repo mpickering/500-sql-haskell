@@ -25,6 +25,7 @@ class Ops r where
   bc_split :: r Char -> r ByteString -> r [ByteString]
   tail_dropwhile :: Char -> r ByteString -> r ByteString
   take_while :: Char -> r ByteString -> r ByteString
+
   _if :: r Bool -> r a -> r a -> r a
   _caseString :: r ByteString -> r a -> r a -> r a
   _fix :: (r a -> r a) -> r a
@@ -34,7 +35,6 @@ class Ops r where
   _putStr :: r ByteString -> r Res
   (>>>) :: r Res -> r Res -> r Res
   _empty :: r Res
-
 
   _embedFile :: FilePath -> r ByteString
   pure :: Lift a => a -> r a
@@ -48,13 +48,11 @@ instance Ops Code where
   eq (Code e1) (Code e2) = Code [|| $$e1 == $$e2 ||]
   neq (Code e1) (Code e2) = Code [|| $$e1 /= $$e2 ||]
   bc_split (Code e1) (Code e2) = Code [|| BC.split $$e1 $$e2 ||]
-  --_show (Code a) = Code [|| show $$a ||]
   _if (Code a) (Code b) (Code c) = Code [|| if $$a then $$b else $$c ||]
   _caseString (Code a) (Code b) (Code c) =
     Code [|| case $$a of
                 "" -> $$b
                 _  -> $$c ||]
-  --(+++) (Code a) (Code b) = Code [|| $$a ++ $$b ||]
   (>>>) (Code a) (Code b) = Code [|| $$a >> $$b ||]
   _empty = Code [|| return () ||]
 
