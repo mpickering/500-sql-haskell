@@ -50,7 +50,9 @@ processCSV fp yld = do
 
 
 printFields :: Fields -> IO ()
-printFields = print
+printFields [] = putStr "\n"
+printFields [b] = BC.putStr b >> putStr "\n"
+printFields (b:bs) = BC.putStr b >> BC.putStr "," >> printFields bs
 
 evalPred :: Predicate -> Record -> Bool
 evalPred  predicate rec =
