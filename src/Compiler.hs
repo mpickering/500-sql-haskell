@@ -39,6 +39,7 @@ infixl 4 <*>
 
 type Fields = [QTExp ByteString]
 type Schema = [ByteString]
+type Res = IO ()
 type Table = FilePath
 
 data Record = Record { fields :: Fields, schema :: Schema }
@@ -74,20 +75,20 @@ parseRow' [_] b = [|| (BC.tail (BC.dropWhile (/= '\n') $$b)) ||]
 parseRow' (_:ss) b = parseRow' ss [||  (BC.tail (BC.dropWhile (/= ',') $$b)) ||]
 
 
-processCSV :: Schema -> Code ByteString -> (Record -> QTExp String) -> QTExp String
+processCSV :: Schema -> Code ByteString -> (Record -> QTExp Res) -> QTExp Res
 processCSV ss (Code bs) yld =
   [|| $$(rows ss) $$bs ||]
   where
-    rows :: Schema -> QTExp (ByteString -> String)
+    rows :: Schema -> QTExp (ByteString -> Res)
     rows sch = do
       [||
         fix (\r rs ->
           case rs of
-            "" -> ""
+            "" -> return ()
             _ ->
               $$(let (_, fs) = parseRow sch [||rs||]
                      head_rec = yld (Record fs sch)
-                 in head_rec) ++ r $$(parseRow' sch [||rs||]) )||]
+                 in head_rec) >> r $$(parseRow' sch [||rs||]) )||]
 
 
     parseRow :: Schema -> QTExp ByteString -> (QTExp ByteString, [QTExp ByteString])
@@ -103,11 +104,11 @@ processCSV ss (Code bs) yld =
 
 
 
-printFields :: Fields -> QTExp String
-printFields [] = [|| "\n" ||]
-printFields [x] = [|| show $$x ++ "\n" ||]
+printFields :: Fields -> QTExp Res
+printFields [] = [|| return () ||]
+printFields [x] = [|| print $$x ||]
 printFields (x:xs) =
-  [|| show $$x ++ $$(printFields xs) ||]
+  [||  B.putStr $$x >> $$(printFields xs) ||]
 
 evalPred :: Predicate -> Record -> Code Bool
 evalPred predicate rec =
@@ -124,8 +125,8 @@ restrict :: Record -> Schema -> Schema -> Record
 restrict r newSchema parentSchema =
   Record (map (flip getField r) parentSchema) newSchema
 
-embedFileT :: FilePath -> QTExp ByteString
-embedFileT = unsafeTExpCoerce . embedFile
+embedFileT :: FilePath -> Code ByteString
+embedFileT = Code . unsafeTExpCoerce . embedFile
 
 embedFile :: FilePath -> Q Exp
 embedFile fp = (runIO $ B.readFile fp) >>= bsToExp
@@ -139,14 +140,14 @@ bsToExp bs = do
 stringToBs :: String -> B.ByteString
 stringToBs = BC.pack
 
-execOp :: Operator -> (Record -> QTExp String) -> QTExp String
+execOp :: Operator -> (Record -> QTExp Res) -> QTExp Res
 execOp op yld =
   case op of
     Scan file sch ->
-      processCSV sch (Code (embedFileT file)) yld
+      processCSV sch (embedFileT file) yld
     Print p       -> execOp p (printFields . fields)
     Filter predicate parent -> execOp parent
-      (\rec -> [|| if $$(runCode $ evalPred predicate rec) then $$(yld rec) else "" ||] )
+      (\rec -> [|| when $$(runCode $ evalPred predicate rec) $$(yld rec) ||] )
     Project newSchema parentSchema parent -> execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
@@ -155,13 +156,13 @@ execOp op yld =
         in yld (Record (fields rec ++ fields rec')
                        (schema rec ++ schema rec'))))
 
-runQuery :: Operator -> QTExp String
-runQuery q = execOp (Print q) (\_ -> [|| "" ||])
+runQuery :: Operator -> QTExp Res
+runQuery q = execOp (Print q) (\_ -> [|| return () ||])
 
 test :: IO ()
 test = do
 --  processCSV "data/test.csv" (print . getField "name")
-  expr <- runQ $ unTypeQ  $ execOp (Print query) (\_ -> [|| "" ||])
+  expr <- runQ $ unTypeQ  $ execOp (Print query) (\_ -> [|| return () ||])
 --  expr <- runQ $ unTypeQ  $ power
   putStrLn $ pprint expr
 
