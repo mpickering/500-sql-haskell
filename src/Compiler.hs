@@ -112,9 +112,9 @@ processCSV ss (Code bs) yld =
 
 printFields :: Fields -> QTExp Res
 printFields [] = [|| return () ||]
-printFields [x] = [|| print $$x ||]
+printFields [x] = [|| BC.putStrLn $$x ||]
 printFields (x:xs) =
-  [||  B.putStr $$x >> $$(printFields xs) ||]
+  [||  B.putStr $$x >> BC.putStr "," >> $$(printFields xs) ||]
 
 evalPred :: Predicate -> Record -> Code Bool
 evalPred predicate rec =
