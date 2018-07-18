@@ -49,6 +49,9 @@ getField field (Record fs sch) =
   let i = fromJust (elemIndex field sch)
   in  (fs !! i)
 
+getFields :: [ByteString] -> Record -> [QTExp ByteString]
+getFields fs r = map (flip getField r) fs
+
 
 data Operator = Scan FilePath Schema | Print Operator | Project Schema Schema Operator
               | Filter Predicate Operator | Join Operator Operator deriving Show
@@ -140,6 +143,11 @@ bsToExp bs = do
 stringToBs :: String -> B.ByteString
 stringToBs = BC.pack
 
+_eq :: Eq a => [QTExp a] -> [QTExp a] -> QTExp Bool
+_eq [] [] = [|| True ||]
+_eq (v:vs) (v1:v1s) = [|| if $$v == $$v1 then $$(_eq vs v1s) else False ||]
+_eq _ _ = [|| False ||]
+
 execOp :: Operator -> (Record -> QTExp Res) -> QTExp Res
 execOp op yld =
   case op of
@@ -152,9 +160,9 @@ execOp op yld =
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'
-        -- TODO: This is wrong
-        in yld (Record (fields rec ++ fields rec')
-                       (schema rec ++ schema rec'))))
+        in [|| when $$(_eq (getFields keys rec) (getFields keys rec'))
+                ($$(yld (Record (fields rec ++ fields rec')
+                                (schema rec ++ schema rec')))) ||] ))
 
 runQuery :: Operator -> QTExp Res
 runQuery q = execOp (Print q) (\_ -> [|| return () ||])
