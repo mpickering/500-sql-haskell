@@ -3,16 +3,24 @@
 --{-# OPTIONS_GHC -ddump-splices #-}
 module Test where
 
-import Compiler
+import qualified Compiler as C
 import qualified LMS as L
+import qualified Interpreter as I
+
 
 main = do
-  ($$(runQuery query))
-  ($$(runQuery query2))
+  I.runQuery I.query
+  I.runQuery I.queryJoin
 
-  ($$(L.runQuery L.query))
-  ($$(L.runQuery L.query2))
+  $$(C.runQuery C.query)
+  $$(C.runQuery C.query2)
+  $$(C.runQuery C.queryJoin)
 
-  (L.runQueryUnstaged L.query)
-  (L.runQueryUnstaged L.query2)
+  $$(L.runQuery L.query)
+  $$(L.runQuery L.query2)
+  $$(L.runQuery L.queryJoin)
+
+  L.runQueryUnstaged L.query
+  L.runQueryUnstaged L.query2
+  L.runQueryUnstaged L.queryJoin
 

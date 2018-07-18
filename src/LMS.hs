@@ -92,7 +92,7 @@ instance Ops Identity where
   (>>>) = liftA2 (>>)
 
 
-  _embedFile = Identity . unsafePerformIO . BC.readFile
+  _embedFile = Identity . BC.tail . (BC.dropWhile (/= '\n')) . unsafePerformIO . BC.readFile
 
   pure = Identity
   (<*>) (Identity a1) (Identity a2) = Identity (a1 a2)
@@ -136,6 +136,8 @@ query = Project ["age"] ["age"] (Filter (Eq (Value "john") (Field "name")) (Scan
 
 query2 = Project ["name"] ["name"] (Filter (Eq (Value "34") (Field "age")) (Scan "data/test.csv" ["name", "age"]))
 
+queryJoin :: Operator
+queryJoin = Join (Scan "data/test.csv" ["name", "age"]) (Scan "data/test1.csv" ["name", "weight"])
 
 data Predicate = Eq Ref Ref | Ne Ref Ref deriving Show
 
@@ -179,9 +181,9 @@ processCSV ss bs yld =
 
 printFields :: Ops r => Fields r -> r Res
 printFields [] = _empty
-printFields [x] = _print x
+printFields [x] = _putStr x >>> _putStr (pure "\n")
 printFields (x:xs) =
-  _putStr x >>> printFields xs
+  _putStr x >>> _putStr (pure ",") >>> printFields xs
 
 evalPred :: Ops r => Predicate -> Record r -> r Bool
 evalPred  predicate rec =
@@ -212,7 +214,6 @@ execOp op yld =
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'
-        -- TODO: Fix
         in _when (list_eq (getFields keys rec) (getFields keys rec'))
                (yld (Record (fields rec ++ fields rec')
                        (schema rec ++ schema rec')))))
@@ -240,7 +241,7 @@ embedFile fp = (runIO $ B.readFile fp) >>= bsToExp
 bsToExp :: B.ByteString -> Q Exp
 bsToExp bs = do
     helper <- [| stringToBs |]
-    let chars = BC.unpack bs
+    let chars = BC.unpack . BC.tail . (BC.dropWhile (/= '\n')) $ bs
     return $! AppE helper $! LitE $! StringL chars
 
 stringToBs :: String -> B.ByteString

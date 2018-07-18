@@ -62,6 +62,9 @@ query = Project ["age"] ["age"] (Filter (Eq (Value "john") (Field "name")) (Scan
 query2 :: Operator
 query2 = Project ["name"] ["name"] (Filter (Eq (Value "34") (Field "age")) (Scan "data/test.csv" ["name", "age"]))
 
+queryJoin :: Operator
+queryJoin = Join (Scan "data/test.csv" ["name", "age"]) (Scan "data/test1.csv" ["name", "weight"])
+
 
 data Predicate = Eq Ref Ref | Ne Ref Ref deriving Show
 
@@ -137,7 +140,7 @@ embedFile fp = (runIO $ B.readFile fp) >>= bsToExp
 bsToExp :: B.ByteString -> Q Exp
 bsToExp bs = do
     helper <- [| stringToBs |]
-    let chars = BC.unpack bs
+    let chars = BC.unpack . BC.tail . (BC.dropWhile (/= '\n')) $ bs
     return $! AppE helper $! LitE $! StringL chars
 
 stringToBs :: String -> B.ByteString

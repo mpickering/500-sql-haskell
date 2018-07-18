@@ -22,6 +22,9 @@ data Operator = Scan Table | Print Operator | Project Schema Schema Operator
 query :: Operator
 query = Project ["name"] ["name"] (Scan "data/test.csv")
 
+queryJoin :: Operator
+queryJoin = Join (Scan "data/test.csv") (Scan "data/test1.csv")
+
 
 data Predicate = Eq Ref Ref | Ne Ref Ref
 
@@ -84,6 +87,10 @@ execOp op yld =
         in when (getFields keys rec == getFields keys rec')
             (yld (Record (fields rec ++ fields rec')
                        (schema rec ++ schema rec')))))
+
+
+runQuery :: Operator -> IO ()
+runQuery o = execOp (Print o) (\_ -> return ())
 
 main :: IO ()
 main = do
