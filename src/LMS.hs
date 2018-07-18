@@ -7,17 +7,14 @@ module LMS where
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import Data.ByteString (ByteString)
-import qualified Scanner as S
 import Control.Monad
 import Data.List
 import Data.Maybe
 import Language.Haskell.TH
-import Language.Haskell.TH
 import Language.Haskell.TH.Syntax
 import Prelude hiding (Applicative(..))
-import Instances.TH.Lift
+import Instances.TH.Lift ()
 --import Data.FileEmbed
-import Debug.Trace
 import Data.Functor.Identity
 import Control.Applicative (liftA2)
 import System.IO.Unsafe
@@ -111,6 +108,7 @@ getField field (Record fs sch) =
 data Operator = Scan FilePath Schema | Print Operator | Project Schema Schema Operator
               | Filter Predicate Operator | Join Operator Operator deriving Show
 
+query, query2 :: Operator
 query = Project ["age"] ["age"] (Filter (Eq (Value "john") (Field "name")) (Scan "data/test.csv" ["name", "age"]))
 
 query2 = Project ["name"] ["name"] (Filter (Eq (Value "34") (Field "age")) (Scan "data/test.csv" ["name", "age"]))
@@ -127,7 +125,7 @@ fix f = let x = f x in x
 
 parseRow' :: Ops r => Schema -> r (ByteString -> ByteString)
 parseRow' [] = _lam id
-parseRow' [n] = _lam (\bs -> tail_dropwhile '\n' bs)
+parseRow' [_] = _lam (\bs -> tail_dropwhile '\n' bs)
 parseRow' (_:ss) = _lam (\bs -> parseRow' ss <*> tail_dropwhile ',' bs)
 
 processCSV :: forall r . Ops r => Schema -> r ByteString -> (Record r -> r String) -> r String
@@ -135,23 +133,23 @@ processCSV ss bs yld =
   rows ss <*> bs
   where
     rows :: Ops r => Schema -> r (ByteString -> String)
-    rows schema = do
+    rows sch = do
         _fix (\r -> _lam (\rs ->
           _caseString rs (pure "")
-                ((let (_, fields) = parseRow schema rs
-                      head = yld (Record fields schema)
-                 in head) +++ (r <*>) (parseRow' schema <*> rs) )))
+                ((let (_, fs) = parseRow sch rs
+                  in yld (Record fs sch)
+                  ) +++ (r <*>) (parseRow' sch <*> rs) )))
 
 
     parseRow :: Ops r => Schema -> r ByteString -> (r ByteString, [r ByteString])
     parseRow [] b = (b, [])
-    parseRow [n] b =
+    parseRow [_] b =
       ( tail_dropwhile ',' b
       , [take_while '\n' b])
 
-    parseRow (_:ss) b =
+    parseRow (_:ss') b =
       let new = tail_dropwhile ',' b
-          (final, rs) = parseRow ss new
+          (final, rs) = parseRow ss' new
       in (final, take_while ',' b : rs)
 
 
@@ -163,8 +161,8 @@ printFields (x:xs) =
   _show x +++ printFields xs
 
 evalPred :: Ops r => Predicate -> Record r -> r Bool
-evalPred  pred rec =
-  case pred of
+evalPred  predicate rec =
+  case predicate of
     Eq a b -> eq (evalRef a rec) (evalRef b rec)
     Ne a b -> neq (evalRef a rec) (evalRef b rec)
 
@@ -181,24 +179,27 @@ restrict r newSchema parentSchema =
 execOp :: Ops r => Operator -> (Record r -> r String) -> r String
 execOp op yld =
   case op of
-    Scan file schema ->
-      processCSV schema (_embedFile file) yld
+    Scan file sch ->
+      processCSV sch (_embedFile file) yld
     Print p       -> execOp p (printFields . fields)
-    Filter pred parent -> execOp parent
-      (\rec -> _if (evalPred pred rec) (yld rec) (pure "") )
+    Filter predicate parent -> execOp parent
+      (\rec -> _if (evalPred predicate rec) (yld rec) (pure "") )
     Project newSchema parentSchema parent ->
       execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'
+        -- TODO: Fix
         in yld (Record (fields rec ++ fields rec')
                        (schema rec ++ schema rec'))))
 
 runQuery :: Operator -> Q (TExp String)
 runQuery q = runCode $ execOp (Print q) (\_ -> pure "")
 
+runQueryUnstaged :: Operator -> String
 runQueryUnstaged q = runIdentity (execOp (Print q) (\_ -> ""))
 
+test :: IO ()
 test = do
 --  processCSV "data/test.csv" (print . getField "name")
   expr <- runQ $ unTypeQ  $ runCode $ execOp (Print query) (\_ -> Code [|| "" ||])

@@ -6,17 +6,13 @@ module Compiler where
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import Data.ByteString (ByteString)
-import qualified Scanner as S
 import Control.Monad
 import Data.List
 import Data.Maybe
 import Language.Haskell.TH
-import Language.Haskell.TH
 import Language.Haskell.TH.Syntax
 import Prelude hiding (Applicative(..))
-import Instances.TH.Lift
---import Data.FileEmbed
-import Debug.Trace
+import Instances.TH.Lift ()
 
 class Ops r where
   eq :: Eq a => r a -> r a -> r Bool
@@ -56,8 +52,10 @@ getField field (Record fs sch) =
 data Operator = Scan FilePath Schema | Print Operator | Project Schema Schema Operator
               | Filter Predicate Operator | Join Operator Operator deriving Show
 
+query :: Operator
 query = Project ["age"] ["age"] (Filter (Eq (Value "john") (Field "name")) (Scan "data/test.csv" ["name", "age"]))
 
+query2 :: Operator
 query2 = Project ["name"] ["name"] (Filter (Eq (Value "34") (Field "age")) (Scan "data/test.csv" ["name", "age"]))
 
 
@@ -72,7 +70,7 @@ fix f = let x = f x in x
 
 parseRow' :: Schema -> QTExp ByteString -> QTExp ByteString
 parseRow' [] b = b
-parseRow' [n] b = [|| (BC.tail (BC.dropWhile (/= '\n') $$b)) ||]
+parseRow' [_] b = [|| (BC.tail (BC.dropWhile (/= '\n') $$b)) ||]
 parseRow' (_:ss) b = parseRow' ss [||  (BC.tail (BC.dropWhile (/= ',') $$b)) ||]
 
 
@@ -81,26 +79,26 @@ processCSV ss (Code bs) yld =
   [|| $$(rows ss) $$bs ||]
   where
     rows :: Schema -> QTExp (ByteString -> String)
-    rows schema = do
+    rows sch = do
       [||
         fix (\r rs ->
           case rs of
             "" -> ""
             _ ->
-              $$(let (_, fields) = parseRow schema [||rs||]
-                     head = yld (Record fields schema)
-                 in head) ++ r $$(parseRow' schema [||rs||]) )||]
+              $$(let (_, fs) = parseRow sch [||rs||]
+                     head_rec = yld (Record fs sch)
+                 in head_rec) ++ r $$(parseRow' sch [||rs||]) )||]
 
 
     parseRow :: Schema -> QTExp ByteString -> (QTExp ByteString, [QTExp ByteString])
     parseRow [] b = (b, [])
-    parseRow [n] b =
+    parseRow [_] b =
       ([|| let res = BC.dropWhile (/= '\n') $$b in BC.tail res ||]
       , [[|| BC.takeWhile (/= '\n') $$b ||]])
 
-    parseRow (_:ss) b =
+    parseRow (_:ss') b =
       let new = [|| let res = BC.dropWhile (/= ',') $$b in BC.tail res ||]
-          (final, rs) = parseRow ss new
+          (final, rs) = parseRow ss' new
       in (final, [|| BC.takeWhile (/= ',') $$b ||] : rs)
 
 
@@ -112,8 +110,8 @@ printFields (x:xs) =
   [|| show $$x ++ $$(printFields xs) ||]
 
 evalPred :: Predicate -> Record -> Code Bool
-evalPred  pred rec =
-  case pred of
+evalPred predicate rec =
+  case predicate of
     Eq a b -> eq (evalRef a rec) (evalRef b rec)
     Ne a b -> neq (evalRef a rec) (evalRef b rec)
 
@@ -142,23 +140,25 @@ stringToBs :: String -> B.ByteString
 stringToBs = BC.pack
 
 execOp :: Operator -> (Record -> QTExp String) -> QTExp String
-execOp op yld = traceShow ("execOp", op) $
+execOp op yld =
   case op of
-    Scan file schema ->
-      processCSV schema (Code (embedFileT file)) yld
+    Scan file sch ->
+      processCSV sch (Code (embedFileT file)) yld
     Print p       -> execOp p (printFields . fields)
-    Filter pred parent -> execOp parent
-      (\rec -> [|| if $$(runCode $ evalPred pred rec) then $$(yld rec) else "" ||] )
+    Filter predicate parent -> execOp parent
+      (\rec -> [|| if $$(runCode $ evalPred predicate rec) then $$(yld rec) else "" ||] )
     Project newSchema parentSchema parent -> execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'
+        -- TODO: This is wrong
         in yld (Record (fields rec ++ fields rec')
                        (schema rec ++ schema rec'))))
 
 runQuery :: Operator -> QTExp String
 runQuery q = execOp (Print q) (\_ -> [|| "" ||])
 
+test :: IO ()
 test = do
 --  processCSV "data/test.csv" (print . getField "name")
   expr <- runQ $ unTypeQ  $ execOp (Print query) (\_ -> [|| "" ||])

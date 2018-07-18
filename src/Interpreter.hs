@@ -4,7 +4,6 @@ module Interpreter where
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import Data.ByteString (ByteString)
-import qualified Scanner as S
 import Control.Monad
 import Data.List
 import Data.Maybe
@@ -20,6 +19,7 @@ data Record = Record { fields :: Fields, schema :: Schema } deriving Show
 data Operator = Scan Table | Print Operator | Project Schema Schema Operator
               | Filter Predicate Operator | Join Operator Operator
 
+query :: Operator
 query = Project ["name"] ["name"] (Scan "data/test.csv")
 
 
@@ -50,8 +50,8 @@ printFields :: Fields -> IO ()
 printFields = print
 
 evalPred :: Predicate -> Record -> Bool
-evalPred  pred rec =
-  case pred of
+evalPred  predicate rec =
+  case predicate of
     Eq a b -> evalRef a rec == evalRef b rec
     Ne a b -> evalRef a rec /= evalRef b rec
 
@@ -73,14 +73,16 @@ execOp op yld =
   case op of
     Scan filename -> processCSV filename yld
     Print p       -> execOp p (printFields . fields)
-    Filter pred parent -> execOp parent (\rec -> when (evalPred pred rec) (yld rec))
+    Filter predicate parent -> execOp parent (\rec -> when (evalPred predicate rec) (yld rec))
     Project newSchema parentSchema parent -> execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'
+        -- TODO: Fix this
         in yld (Record (fields rec ++ fields rec')
                        (schema rec ++ schema rec'))))
 
+main :: IO ()
 main = do
   processCSV "data/test.csv" (print . getField "name")
   execOp (Print query) (\_ -> return ())
