@@ -98,6 +98,13 @@ instance Ops Identity where
   (<*>) (Identity a1) (Identity a2) = Identity (a1 a2)
 
 
+list_eq :: (Ops r, Eq a) => [r a] -> [r a] -> r Bool
+list_eq [] [] = pure True
+list_eq (v:vs) (v1:v1s) = _if (eq v v1) (list_eq vs v1s) (pure False)
+list_eq _ _ = pure False
+
+_when :: Ops r => r Bool -> r Res -> r Res
+_when cond act = _if cond act _empty
 
 runCode :: Code a -> Q (TExp a)
 runCode (Code a) = a
@@ -112,10 +119,13 @@ type Res = IO ()
 
 data Record r = Record { fields :: Fields r, schema :: Schema }
 
-getField :: Ops r => ByteString -> Record r -> r ByteString
+getField :: ByteString -> Record r -> r ByteString
 getField field (Record fs sch) =
   let i = fromJust (elemIndex field sch)
   in  (fs !! i)
+
+getFields :: [ByteString] -> Record r -> [r ByteString]
+getFields fs r = map (flip getField r) fs
 
 
 data Operator = Scan FilePath Schema | Print Operator | Project Schema Schema Operator
@@ -203,8 +213,9 @@ execOp op yld =
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'
         -- TODO: Fix
-        in yld (Record (fields rec ++ fields rec')
-                       (schema rec ++ schema rec'))))
+        in _when (list_eq (getFields keys rec) (getFields keys rec'))
+               (yld (Record (fields rec ++ fields rec')
+                       (schema rec ++ schema rec')))))
 
 runQuery :: Operator -> Q (TExp Res)
 runQuery q = runCode $ execOp (Print q) (\_ -> _empty )
