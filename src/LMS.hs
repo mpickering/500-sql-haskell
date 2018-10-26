@@ -18,6 +18,7 @@ import Instances.TH.Lift ()
 import Data.Functor.Identity
 import Control.Applicative (liftA2)
 import System.IO.Unsafe
+import qualified Prelude as P
 
 class Ops r where
   eq :: Eq a => r a -> r a -> r Bool
@@ -31,10 +32,17 @@ class Ops r where
   _fix :: (r a -> r a) -> r a
   _lam :: (r a -> r b) -> r (a -> b)
 
+  _bind :: Monad m => r (m a) -> (r (a -> m b)) -> r (m b)
   _print :: Show a => r a -> r Res
   _putStr :: r ByteString -> r Res
   (>>>) :: r Res -> r Res -> r Res
   _empty :: r Res
+  _pure :: P.Applicative f => r a -> r (f a)
+
+  -- Scanner interface
+  _newScanner :: FilePath -> r (IO Scanner)
+  _hasNext :: r Scanner -> r Bool
+  _nextLine :: r Scanner -> (r ByteString, r Scanner)
 
   _embedFile :: FilePath -> r ByteString
   pure :: Lift a => a -> r a
@@ -54,7 +62,9 @@ instance Ops Code where
                 "" -> $$b
                 _  -> $$c ||]
   (>>>) (Code a) (Code b) = Code [|| $$a >> $$b ||]
+  _bind (Code a) (Code b) = Code [|| $$a >>= $$b ||]
   _empty = Code [|| return () ||]
+  _pure (Code p) = Code [|| P.pure $$p ||]
 
   _print (Code a) = Code [|| print $$a ||]
   _putStr (Code a) = Code [|| BC.putStr $$a ||]
@@ -66,6 +76,12 @@ instance Ops Code where
   _lam f = Code $ [|| \a ->  $$(runCode $ f (Code [|| a ||]))  ||]
 
   _embedFile = embedFileT
+
+  _newScanner fp = Code [|| newScanner fp ||]
+  _hasNext s = Code [|| hasNext $$(runCode s) ||]
+  _nextLine = _nextLineCode
+
+
 
   pure = Code . unsafeTExpCoerce . lift
   (Code f) <*> (Code a) = Code [|| $$f $$a ||]
@@ -88,6 +104,11 @@ instance Ops Identity where
   _fix = fix
   _lam f = Identity (\a -> runIdentity (f (Identity a)))
   (>>>) = liftA2 (>>)
+  _bind = liftA2 (>>=)
+  _pure = fmap (P.pure)
+  _newScanner fp = Identity (newScanner fp)
+  _hasNext = fmap hasNext
+  _nextLine = nextLine
 
 
   _embedFile = Identity . BC.tail . (BC.dropWhile (/= '\n')) . unsafePerformIO . BC.readFile
@@ -103,6 +124,9 @@ list_eq _ _ = pure False
 
 _when :: Ops r => r Bool -> r Res -> r Res
 _when cond act = _if cond act _empty
+
+_whenA :: (P.Applicative f, Ops r) => r Bool -> r (f ()) -> r (f ())
+_whenA cond act = _if cond act (_pure (pure ()))
 
 runCode :: Code a -> Q (TExp a)
 runCode (Code a) = a
@@ -146,36 +170,56 @@ type QTExp a = Code a
 fix :: (a -> a) -> a
 fix f = let x = f x in x
 
-parseRow' :: Ops r => Schema -> r (ByteString -> ByteString)
-parseRow' [] = _lam id
-parseRow' [_] = _lam (\bs -> tail_dropwhile '\n' bs)
-parseRow' (_:ss) = _lam (\bs -> parseRow' ss <*> tail_dropwhile ',' bs)
+data Scanner = Scanner ByteString
 
-processCSV :: forall r . Ops r => Schema -> r ByteString -> (Record r -> r Res) -> r Res
-processCSV ss bs yld =
-  rows ss <*> bs
+newScanner :: FilePath -> IO Scanner
+newScanner fp = Scanner <$>  B.readFile fp
+
+nextLine :: Identity Scanner -> (Identity ByteString, Identity Scanner)
+nextLine (Identity (Scanner bs)) =
+  let (fs, rs) = BC.span (/= '\n') bs
+  in (Identity fs, Identity (Scanner (BC.tail rs)))
+
+_nextLineCode :: Code Scanner -> (Code ByteString, Code Scanner)
+_nextLineCode scanner =
+  let fs = Code [|| let (Scanner s) = $$(runCode scanner) in BC.takeWhile (/= '\n') s ||]
+      ts = Code [|| let (Scanner s) = $$(runCode scanner) in Scanner (BC.tail (BC.dropWhile (/= '\n') s)) ||]
+  in (fs, ts)
+
+
+
+hasNext :: Scanner -> Bool
+hasNext (Scanner bs) = bs /= ""
+
+while ::
+  (Ops r, P.Applicative f) =>
+  r (t -> Bool) -> r ((t -> f ()) -> t -> f ()) -> r (t -> f ())
+while k b = _fix (\r -> _lam $ \rs -> _whenA (k <*> rs) (b <*> r <*> rs))
+
+processCSV :: forall r . Ops r => Schema -> FilePath -> (Record r -> r Res) -> r Res
+processCSV ss f yld =
+        _newScanner f `_bind` rows ss
   where
-    rows :: Ops r => Schema -> r (ByteString -> Res)
+    rows :: Schema -> r (Scanner -> Res)
     rows sch = do
-        _fix (\r -> _lam (\rs ->
-          _caseString rs _empty
-                ((let (_, fs) = parseRow sch rs
-                  in yld (Record fs sch)
-                  ) >>> (r <*>) (parseRow' sch <*> rs) )))
+      while (_lam _hasNext)
+            (_lam $ \r -> _lam $ \rs ->
+              (let (hs, ts) = _nextLine rs
+              in yld (Record (parseRow sch hs) sch) >>> (r <*> ts))
+              )
 
-
-    parseRow :: Ops r => Schema -> r ByteString -> (r ByteString, [r ByteString])
-    parseRow [] b = (b, [])
+    -- We can't use the standard |BC.split| function here because
+    -- we we statically know how far we will unroll. The result is then
+    -- more static as we can do things like drop certain fields if we
+    -- perform a projection.
+    parseRow :: Schema -> r ByteString -> [r ByteString]
+    parseRow [] _ = []
     parseRow [_] b =
-      ( tail_dropwhile ',' b
-      , [take_while '\n' b])
-
+      [take_while '\n' b]
     parseRow (_:ss') b =
       let new = tail_dropwhile ',' b
-          (final, rs) = parseRow ss' new
-      in (final, take_while ',' b : rs)
-
-
+          rs = parseRow ss' new
+      in (take_while ',' b  : rs)
 
 printFields :: Ops r => Fields r -> r Res
 printFields [] = _empty
@@ -203,7 +247,7 @@ execOp :: Ops r => Operator -> (Record r -> r Res) -> r Res
 execOp op yld =
   case op of
     Scan file sch ->
-      processCSV sch (_embedFile file) yld
+      processCSV sch file yld
     Print p       -> execOp p (printFields . fields)
     Filter predicate parent -> execOp parent
       (\rec -> _if (evalPred predicate rec) (yld rec) _empty )

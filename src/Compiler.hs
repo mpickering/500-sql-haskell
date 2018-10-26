@@ -12,23 +12,22 @@ import Data.Maybe
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax
 import Prelude hiding (Applicative(..))
+import qualified Prelude as P
 import Instances.TH.Lift ()
 
-class Ops r where
-  eq :: Eq a => r a -> r a -> r Bool
-  neq :: Eq a => r a -> r a -> r Bool
-  bc_split :: r Char -> r ByteString -> r [ByteString]
+eq :: Eq a => Code a -> Code a -> Code Bool
+eq (Code e1) (Code e2) = Code [|| $$e1 == $$e2 ||]
 
-instance Ops Code where
-  eq (Code e1) (Code e2) = Code [|| $$e1 == $$e2 ||]
-  neq (Code e1) (Code e2) = Code [|| $$e1 /= $$e2 ||]
-  bc_split (Code e1) (Code e2) = Code [|| BC.split $$e1 $$e2 ||]
+neq :: Eq a => Code a -> Code a -> Code Bool
+neq (Code e1) (Code e2) = Code [|| $$e1 /= $$e2 ||]
+
+bc_split :: Code Char -> Code ByteString -> Code [ByteString]
+bc_split (Code e1) (Code e2) = Code [|| BC.split $$e1 $$e2 ||]
 
 newtype Code a = Code (Q (TExp a))
 
 runCode :: Code a -> QTExp a
 runCode (Code a) = a
-
 
 pure :: Lift a => a -> Code a
 pure = Code . unsafeTExpCoerce . lift
@@ -52,7 +51,6 @@ getField field (Record fs sch) =
 getFields :: [ByteString] -> Record -> [QTExp ByteString]
 getFields fs r = map (flip getField r) fs
 
-
 data Operator = Scan FilePath Schema | Print Operator | Project Schema Schema Operator
               | Filter Predicate Operator | Join Operator Operator deriving Show
 
@@ -65,7 +63,6 @@ query2 = Project ["name"] ["name"] (Filter (Eq (Value "34") (Field "age")) (Scan
 queryJoin :: Operator
 queryJoin = Join (Scan "data/test.csv" ["name", "age"]) (Scan "data/test1.csv" ["name", "weight"])
 
-
 data Predicate = Eq Ref Ref | Ne Ref Ref deriving Show
 
 data Ref = Field ByteString | Value ByteString deriving Show
@@ -75,38 +72,51 @@ type QTExp a = Q (TExp a)
 fix :: (a -> a) -> a
 fix f = let x = f x in x
 
-parseRow' :: Schema -> QTExp ByteString -> QTExp ByteString
-parseRow' [] b = b
-parseRow' [_] b = [|| (BC.tail (BC.dropWhile (/= '\n') $$b)) ||]
-parseRow' (_:ss) b = parseRow' ss [||  (BC.tail (BC.dropWhile (/= ',') $$b)) ||]
+data Scanner = Scanner ByteString
 
+newScanner :: FilePath -> IO Scanner
+newScanner fp = Scanner <$>  B.readFile fp
 
-processCSV :: Schema -> Code ByteString -> (Record -> QTExp Res) -> QTExp Res
-processCSV ss (Code bs) yld =
-  [|| $$(rows ss) $$bs ||]
+nextLine :: Scanner -> (ByteString, Scanner)
+nextLine (Scanner bs) =
+  let (fs, rs) = BC.span (/= '\n') bs
+  in (fs, Scanner (BC.tail rs))
+
+hasNext :: Scanner -> Bool
+hasNext (Scanner bs) = bs /= ""
+
+while ::
+  P.Applicative f =>
+  QTExp (t -> Bool) -> QTExp ((t -> f ()) -> t -> f ()) -> QTExp (t -> f ())
+while k b = [|| fix (\r rs -> when ($$k rs) ($$b r rs)) ||]
+
+processCSV :: Schema -> FilePath -> (Record -> QTExp Res) -> QTExp Res
+processCSV ss f yld =
+  [|| do
+        bs <- newScanner f
+        $$(rows ss) bs ||]
   where
-    rows :: Schema -> QTExp (ByteString -> Res)
+    rows :: Schema -> QTExp (Scanner -> Res)
     rows sch = do
-      [||
-        fix (\r rs ->
-          case rs of
-            "" -> return ()
-            _ ->
-              $$(let (_, fs) = parseRow sch [||rs||]
-                     head_rec = yld (Record fs sch)
-                 in head_rec) >> r $$(parseRow' sch [||rs||]) )||]
+      while [|| hasNext ||]
+            [|| \r rs -> do
+                  let (hs, ts) = nextLine rs
+                  ($$(let fs = parseRow sch [||hs||]
+                          head_rec = yld (Record fs sch)
+                   in head_rec) >> r ts)||]
 
-
-    parseRow :: Schema -> QTExp ByteString -> (QTExp ByteString, [QTExp ByteString])
-    parseRow [] b = (b, [])
+    -- We can't use the standard |BC.split| function here because
+    -- we we statically know how far we will unroll. The result is then
+    -- more static as we can do things like drop certain fields if we
+    -- perform a projection.
+    parseRow :: Schema -> QTExp ByteString -> [QTExp ByteString]
+    parseRow [] _ = []
     parseRow [_] b =
-      ([|| let res = BC.dropWhile (/= '\n') $$b in BC.tail res ||]
-      , [[|| BC.takeWhile (/= '\n') $$b ||]])
-
+      [[|| BC.takeWhile (/= '\n') $$b ||]]
     parseRow (_:ss') b =
       let new = [|| let res = BC.dropWhile (/= ',') $$b in BC.tail res ||]
-          (final, rs) = parseRow ss' new
-      in (final, [|| BC.takeWhile (/= ',') $$b ||] : rs)
+          rs = parseRow ss' new
+      in ([|| BC.takeWhile (/= ',') $$b ||] : rs)
 
 
 
@@ -131,21 +141,10 @@ restrict :: Record -> Schema -> Schema -> Record
 restrict r newSchema parentSchema =
   Record (map (flip getField r) parentSchema) newSchema
 
-embedFileT :: FilePath -> Code ByteString
-embedFileT = Code . unsafeTExpCoerce . embedFile
-
-embedFile :: FilePath -> Q Exp
-embedFile fp = (runIO $ B.readFile fp) >>= bsToExp
-
-bsToExp :: B.ByteString -> Q Exp
-bsToExp bs = do
-    helper <- [| stringToBs |]
-    let chars = BC.unpack . BC.tail . (BC.dropWhile (/= '\n')) $ bs
-    return $! AppE helper $! LitE $! StringL chars
-
 stringToBs :: String -> B.ByteString
 stringToBs = BC.pack
 
+-- We can unroll (==) if we statically know the length of each argument.
 _eq :: Eq a => [QTExp a] -> [QTExp a] -> QTExp Bool
 _eq [] [] = [|| True ||]
 _eq (v:vs) (v1:v1s) = [|| if $$v == $$v1 then $$(_eq vs v1s) else False ||]
@@ -155,11 +154,12 @@ execOp :: Operator -> (Record -> QTExp Res) -> QTExp Res
 execOp op yld =
   case op of
     Scan file sch ->
-      processCSV sch (embedFileT file) yld
+      processCSV sch file yld
     Print p       -> execOp p (printFields . fields)
     Filter predicate parent -> execOp parent
       (\rec -> [|| when $$(runCode $ evalPred predicate rec) $$(yld rec) ||] )
-    Project newSchema parentSchema parent -> execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
+    Project newSchema parentSchema parent ->
+      execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'

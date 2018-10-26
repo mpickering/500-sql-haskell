@@ -6,9 +6,15 @@ module Test where
 import qualified Compiler as C
 import qualified LMS as L
 import qualified Interpreter as I
+import qualified SimpleInterpreter as SI
 
-
+main :: IO ()
 main = do
+  putStrLn "Simple Interpreter"
+  SI.runQuery SI.query
+  SI.runQuery SI.queryJoin
+
+
   putStrLn "Interpreter"
   I.runQuery I.query
   I.runQuery I.queryJoin
@@ -27,4 +33,3 @@ main = do
   L.runQueryUnstaged L.query
   L.runQueryUnstaged L.query2
   L.runQueryUnstaged L.queryJoin
-

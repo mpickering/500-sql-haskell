@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Interpreter where
+module SimpleInterpreter where
 
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
@@ -14,7 +14,9 @@ type Table = FilePath
 
 data Record = Record { fields :: Fields, schema :: Schema } deriving Show
 
-data Operator = Scan Table | Print Operator | Project Schema Schema Operator
+
+
+data Operator = Scan Table | Project Schema Schema Operator
               | Filter Predicate Operator | Join Operator Operator
 
 query :: Operator
@@ -28,35 +30,24 @@ data Predicate = Eq Ref Ref | Ne Ref Ref
 
 data Ref = Field ByteString | Value ByteString
 
-data Scanner = Scanner ByteString
-
-newScanner :: FilePath -> IO Scanner
-newScanner fp = Scanner <$>  B.readFile fp
-
-nextLine :: Scanner -> (ByteString, Scanner)
-nextLine (Scanner bs) =
-  let (fs, rs) = BC.span (/= '\n') bs
-  in (fs, Scanner (BC.tail rs))
-
-hasNext :: Scanner -> Bool
-hasNext (Scanner bs) = bs /= ""
-
-processCSV :: FilePath -> (Record -> IO ()) -> IO ()
-processCSV fp yld = do
-  s <- newScanner fp
+processCSV :: FilePath -> IO [Record]
+processCSV fp = do
+  s <- B.readFile fp
   scanner s
 
   where
     scanner s = do
-      let (fs, rs) = nextLine s
-      rows (BC.split ',' fs) rs
+      let (fs, rs) = BC.span (/= '\n') s
+      return $ rows (BC.split ',' fs) (BC.tail rs)
 
-    rows fs s =
-      when (hasNext s)
-        (do
-          let (r, rest) = nextLine s
-          yld (Record (BC.split ',' r) fs)
-          rows fs rest)
+    rows :: Schema -> ByteString -> [Record]
+    rows fs rs =
+      case rs of
+        "" -> []
+        _ ->
+          let (r, rest) = BC.span (/= '\n') rs
+              r' = (Record (BC.split ',' r) fs)
+          in (r' : rows fs (BC.tail rest))
 
 
 printFields :: Fields -> IO ()
@@ -82,32 +73,40 @@ getField field (Record fs sch) =
 getFields :: [ByteString] -> Record -> [ByteString]
 getFields fs r = map (flip getField r) fs
 
-restrict :: Record -> [ByteString] -> [ByteString] -> Record
-restrict r newSchema parentSchema =
+restrict :: [ByteString] -> [ByteString] -> Record -> Record
+restrict newSchema parentSchema r =
   Record (getFields parentSchema r) newSchema
 
-execOp :: Operator -> (Record -> IO ()) -> IO ()
-execOp op yld =
+execOp :: Operator -> IO [Record]
+execOp op  =
   case op of
-    Scan filename -> processCSV filename yld
-    Print p       -> execOp p (printFields . fields)
-    Filter predicate parent -> execOp parent (\rec -> when (evalPred predicate rec) (yld rec))
-    Project newSchema parentSchema parent -> execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
-    Join left right ->
-      execOp left (\rec -> execOp right (\rec' ->
+    Scan filename -> processCSV filename
+    --Print p       -> execOp p (printFields . fields)
+    Filter predicate parent -> do
+      rs <- execOp parent
+      return (filter (evalPred predicate) rs)
+    Project newSchema parentSchema parent -> do
+      rs <- execOp parent
+      return $ map (restrict newSchema parentSchema) rs
+    Join left right -> do
+      ls <- execOp left
+      rs <- execOp right
+      return $ do
+        rec <- ls
+        rec' <- rs
         let keys = schema rec `intersect` schema rec'
-        in when (getFields keys rec == getFields keys rec')
-            (yld (Record (fields rec ++ fields rec')
-                       (schema rec ++ schema rec')))))
+        guard (getFields keys rec == getFields keys rec')
+        (return (Record (fields rec ++ fields rec')
+                       (schema rec ++ schema rec')))
 
 
 runQuery :: Operator -> IO ()
-runQuery o = execOp (Print o) (\_ -> return ())
+runQuery o = execOp o >>= print
 
 main :: IO ()
 main = do
-  processCSV "data/test.csv" (print . getField "name")
-  execOp (Print query) (\_ -> return ())
+--  processCSV "data/test.csv" (print . getField "name")
+  execOp query >>= print
 
 
 
