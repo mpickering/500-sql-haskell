@@ -31,7 +31,7 @@ data Ref = Field ByteString | Value ByteString
 newtype Scanner = Scanner ByteString
 
 newScanner :: FilePath -> IO Scanner
-newScanner fp = Scanner <$>  B.readFile fp
+newScanner fp = Scanner <$> B.readFile fp
 
 nextLine :: Scanner -> (ByteString, Scanner)
 nextLine (Scanner bs) =
