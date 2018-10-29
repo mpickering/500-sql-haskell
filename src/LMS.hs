@@ -35,8 +35,8 @@ class Ops r where
   _bind :: Monad m => r (m a) -> (r (a -> m b)) -> r (m b)
   _print :: Show a => r a -> r Res
   _putStr :: r ByteString -> r Res
-  (>>>) :: r Res -> r Res -> r Res
-  _empty :: r Res
+  (>>>) :: Monoid m => r m -> r m -> r m
+  _empty :: Monoid m => r m
   _pure :: P.Applicative f => r a -> r (f a)
 
   -- Scanner interface
@@ -61,9 +61,9 @@ instance Ops Code where
     Code [|| case $$a of
                 "" -> $$b
                 _  -> $$c ||]
-  (>>>) (Code a) (Code b) = Code [|| $$a >> $$b ||]
+  (>>>) (Code a) (Code b) = Code [|| $$a <> $$b ||]
   _bind (Code a) (Code b) = Code [|| $$a >>= $$b ||]
-  _empty = Code [|| return () ||]
+  _empty = Code [|| mempty ||]
   _pure (Code p) = Code [|| P.pure $$p ||]
 
   _print (Code a) = Code [|| print $$a ||]
@@ -95,7 +95,7 @@ instance Ops Identity where
   take_while c = fmap (BC.takeWhile (/= c))
   _print = fmap print
   _putStr = fmap (BC.putStr)
-  _empty = Identity (return ())
+  _empty = Identity mempty
   _if (Identity b) (Identity c1) (Identity c2) = Identity (if b then c1 else c2)
   _caseString (Identity b) (Identity c1) (Identity c2) =
     Identity (case b of
@@ -103,7 +103,7 @@ instance Ops Identity where
                 _  -> c2)
   _fix = fix
   _lam f = Identity (\a -> runIdentity (f (Identity a)))
-  (>>>) = liftA2 (>>)
+  (>>>) = liftA2 mappend
   _bind = liftA2 (>>=)
   _pure = fmap (P.pure)
   _newScanner fp = Identity (newScanner fp)
@@ -122,7 +122,7 @@ list_eq [] [] = pure True
 list_eq (v:vs) (v1:v1s) = _if (eq v v1) (list_eq vs v1s) (pure False)
 list_eq _ _ = pure False
 
-_when :: Ops r => r Bool -> r Res -> r Res
+_when :: (Monoid m, Ops r) => r Bool -> r m -> r m
 _when cond act = _if cond act _empty
 
 _whenA :: (P.Applicative f, Ops r) => r Bool -> r (f ()) -> r (f ())
@@ -150,7 +150,7 @@ getFields :: [ByteString] -> Record r -> [r ByteString]
 getFields fs r = map (flip getField r) fs
 
 
-data Operator = Scan FilePath Schema | Print Operator | Project Schema Schema Operator
+data Operator = Scan FilePath Schema | Project Schema Schema Operator
               | Filter Predicate Operator | Join Operator Operator deriving Show
 
 query, query2 :: Operator
@@ -180,6 +180,9 @@ nextLine (Identity (Scanner bs)) =
   let (fs, rs) = BC.span (/= '\n') bs
   in (Identity fs, Identity (Scanner (BC.tail rs)))
 
+-- As |span| is not stage aware, it is more dynamic an necessary. Splitting
+-- the implementation up means that we can skip over entire rows if
+-- necessary in the generated code.
 _nextLineCode :: Code Scanner -> (Code ByteString, Code Scanner)
 _nextLineCode scanner =
   let fs = Code [|| let (Scanner s) = $$(runCode scanner) in BC.takeWhile (/= '\n') s ||]
@@ -192,15 +195,18 @@ hasNext :: Scanner -> Bool
 hasNext (Scanner bs) = bs /= ""
 
 while ::
-  (Ops r, P.Applicative f) =>
-  r (t -> Bool) -> r ((t -> f ()) -> t -> f ()) -> r (t -> f ())
-while k b = _fix (\r -> _lam $ \rs -> _whenA (k <*> rs) (b <*> r <*> rs))
+  (Ops r, Monoid m) =>
+  r (t -> Bool) -> r ((t -> IO m) -> t -> IO m) -> r (t -> IO m)
+while k b = _fix (\r -> _lam $ \rs -> _when (k <*> rs) (b <*> r <*> rs))
 
-processCSV :: forall r . Ops r => Schema -> FilePath -> (Record r -> r Res) -> r Res
+whenM :: Monoid m => Bool -> m -> m
+whenM b act = if b then act else mempty
+
+processCSV :: forall m r . (Monoid m, Ops r) => Schema -> FilePath -> (Record r -> r (IO m)) -> r (IO m)
 processCSV ss f yld =
         _newScanner f `_bind` rows ss
   where
-    rows :: Schema -> r (Scanner -> Res)
+    rows :: Schema -> r (Scanner -> (IO m))
     rows sch = do
       while (_lam _hasNext)
             (_lam $ \r -> _lam $ \rs ->
@@ -243,12 +249,11 @@ restrict r newSchema parentSchema =
   Record (map (flip getField r) parentSchema) newSchema
 
 
-execOp :: Ops r => Operator -> (Record r -> r Res) -> r Res
+execOp :: (Monoid m, Ops r) => Operator -> (Record r -> r (IO m)) -> r (IO m)
 execOp op yld =
   case op of
     Scan file sch ->
       processCSV sch file yld
-    Print p       -> execOp p (printFields . fields)
     Filter predicate parent -> execOp parent
       (\rec -> _if (evalPred predicate rec) (yld rec) _empty )
     Project newSchema parentSchema parent ->
@@ -261,15 +266,28 @@ execOp op yld =
                        (schema rec ++ schema rec')))))
 
 runQuery :: Operator -> Q (TExp Res)
-runQuery q = runCode $ execOp (Print q) (\_ -> _empty )
+runQuery q = runCode $ execOp q (printFields . fields)
+
+runQueryL :: Operator -> Q (TExp (IO [Record Identity]))
+runQueryL q = runCode $ execOp q (\r -> Code [|| return (return $$(runCode $ spill r)) ||])
+
+spill :: Record Code -> Code (Record Identity)
+spill (Record rs ss) = Code [|| Record $$(runCode $ spill2 rs) ss ||]
+
+spill2 :: [Code ByteString] -> Code [Identity ByteString]
+spill2 [] = Code [|| [] ||]
+spill2 (x:xs) = Code [|| (Identity $$(runCode x)) : $$(runCode $ spill2 xs) ||]
 
 runQueryUnstaged :: Operator -> Res
-runQueryUnstaged q = runIdentity (execOp (Print q) (\_ -> _empty) )
+runQueryUnstaged q = runIdentity (execOp q (printFields . fields))
+
+runQueryUnstagedL :: Operator -> IO [Record Identity]
+runQueryUnstagedL q = runIdentity (execOp q (return . return . return))
 
 test :: IO ()
 test = do
 --  processCSV "data/test.csv" (print . getField "name")
-  expr <- runQ $ unTypeQ  $ runCode $ execOp (Print query) (\_ -> _empty )
+  expr <- runQ $ unTypeQ  $ runCode $ execOp query (printFields . fields)
 --  expr <- runQ $ unTypeQ  $ power
   putStrLn $ pprint expr
 

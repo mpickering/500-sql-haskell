@@ -14,7 +14,7 @@ type Table = FilePath
 
 data Record = Record { fields :: Fields, schema :: Schema } deriving Show
 
-data Operator = Scan Table | Print Operator | Project Schema Schema Operator
+data Operator = Scan Table | Project Schema Schema Operator
               | Filter Predicate Operator | Join Operator Operator
 
 query :: Operator
@@ -28,7 +28,7 @@ data Predicate = Eq Ref Ref | Ne Ref Ref
 
 data Ref = Field ByteString | Value ByteString
 
-data Scanner = Scanner ByteString
+newtype Scanner = Scanner ByteString
 
 newScanner :: FilePath -> IO Scanner
 newScanner fp = Scanner <$>  B.readFile fp
@@ -41,7 +41,7 @@ nextLine (Scanner bs) =
 hasNext :: Scanner -> Bool
 hasNext (Scanner bs) = bs /= ""
 
-processCSV :: FilePath -> (Record -> IO ()) -> IO ()
+processCSV :: Monoid m => FilePath -> (Record -> IO m) -> IO m
 processCSV fp yld = do
   s <- newScanner fp
   scanner s
@@ -52,11 +52,13 @@ processCSV fp yld = do
       rows (BC.split ',' fs) rs
 
     rows fs s =
-      when (hasNext s)
-        (do
-          let (r, rest) = nextLine s
-          yld (Record (BC.split ',' r) fs)
-          rows fs rest)
+      whenM (hasNext s)
+        (let (r, rest) = nextLine s
+          in yld (Record (BC.split ',' r) fs)
+             <> rows fs rest)
+
+whenM :: Monoid m => Bool -> m -> m
+whenM b act = if b then act else mempty
 
 
 printFields :: Fields -> IO ()
@@ -86,28 +88,30 @@ restrict :: Record -> [ByteString] -> [ByteString] -> Record
 restrict r newSchema parentSchema =
   Record (getFields parentSchema r) newSchema
 
-execOp :: Operator -> (Record -> IO ()) -> IO ()
+execOp :: Monoid m => Operator -> (Record -> IO m) -> IO m
 execOp op yld =
   case op of
     Scan filename -> processCSV filename yld
-    Print p       -> execOp p (printFields . fields)
-    Filter predicate parent -> execOp parent (\rec -> when (evalPred predicate rec) (yld rec))
+    Filter predicate parent -> execOp parent (\rec -> whenM (evalPred predicate rec) (yld rec))
     Project newSchema parentSchema parent -> execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'
-        in when (getFields keys rec == getFields keys rec')
+        in whenM (getFields keys rec == getFields keys rec')
             (yld (Record (fields rec ++ fields rec')
                        (schema rec ++ schema rec')))))
 
 
 runQuery :: Operator -> IO ()
-runQuery o = execOp (Print o) (\_ -> return ())
+runQuery o = execOp o (printFields . fields)
+
+runQueryL :: Operator -> IO [Record]
+runQueryL o = execOp o (return . return)
 
 main :: IO ()
 main = do
   processCSV "data/test.csv" (print . getField "name")
-  execOp (Print query) (\_ -> return ())
+  runQuery query
 
 
 

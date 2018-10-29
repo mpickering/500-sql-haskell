@@ -1,6 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveLift #-}
 module Compiler where
 
 import qualified Data.ByteString as B
@@ -43,6 +45,11 @@ type Table = FilePath
 
 data Record = Record { fields :: Fields, schema :: Schema }
 
+data ResRecord = ResRecord { fields_r :: [ByteString], schema_r :: Schema }
+
+
+
+
 getField :: ByteString -> Record -> QTExp ByteString
 getField field (Record fs sch) =
   let i = fromJust (elemIndex field sch)
@@ -51,7 +58,7 @@ getField field (Record fs sch) =
 getFields :: [ByteString] -> Record -> [QTExp ByteString]
 getFields fs r = map (flip getField r) fs
 
-data Operator = Scan FilePath Schema | Print Operator | Project Schema Schema Operator
+data Operator = Scan FilePath Schema | Project Schema Schema Operator
               | Filter Predicate Operator | Join Operator Operator deriving Show
 
 query :: Operator
@@ -86,17 +93,20 @@ hasNext :: Scanner -> Bool
 hasNext (Scanner bs) = bs /= ""
 
 while ::
-  P.Applicative f =>
-  QTExp (t -> Bool) -> QTExp ((t -> f ()) -> t -> f ()) -> QTExp (t -> f ())
-while k b = [|| fix (\r rs -> when ($$k rs) ($$b r rs)) ||]
+  Monoid m =>
+  QTExp (t -> Bool) -> QTExp ((t -> IO m) -> t -> IO m) -> QTExp (t -> IO m)
+while k b = [|| fix (\r rs -> whenM ($$k rs) ($$b r rs)) ||]
 
-processCSV :: Schema -> FilePath -> (Record -> QTExp Res) -> QTExp Res
+whenM :: Monoid m => Bool -> m -> m
+whenM b act = if b then act else mempty
+
+processCSV :: forall m .Monoid m => Schema -> FilePath -> (Record -> QTExp (IO m)) -> QTExp (IO m)
 processCSV ss f yld =
   [|| do
         bs <- newScanner f
         $$(rows ss) bs ||]
   where
-    rows :: Schema -> QTExp (Scanner -> Res)
+    rows :: Schema -> QTExp (Scanner -> IO m)
     rows sch = do
       while [|| hasNext ||]
             [|| \r rs -> do
@@ -150,30 +160,41 @@ _eq [] [] = [|| True ||]
 _eq (v:vs) (v1:v1s) = [|| if $$v == $$v1 then $$(_eq vs v1s) else False ||]
 _eq _ _ = [|| False ||]
 
-execOp :: Operator -> (Record -> QTExp Res) -> QTExp Res
+execOp :: Monoid m => Operator -> (Record -> QTExp (IO m)) -> QTExp (IO m)
 execOp op yld =
   case op of
     Scan file sch ->
       processCSV sch file yld
-    Print p       -> execOp p (printFields . fields)
     Filter predicate parent -> execOp parent
-      (\rec -> [|| when $$(runCode $ evalPred predicate rec) $$(yld rec) ||] )
+      (\rec -> [|| whenM $$(runCode $ evalPred predicate rec) $$(yld rec) ||] )
     Project newSchema parentSchema parent ->
       execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'
-        in [|| when $$(_eq (getFields keys rec) (getFields keys rec'))
+        in [|| whenM $$(_eq (getFields keys rec) (getFields keys rec'))
                 ($$(yld (Record (fields rec ++ fields rec')
                                 (schema rec ++ schema rec')))) ||] ))
 
 runQuery :: Operator -> QTExp Res
-runQuery q = execOp (Print q) (\_ -> [|| return () ||])
+runQuery q = execOp q (printFields . fields)
+
+
+-- We still need to eliminate the binding time abstraction
+runQueryL :: Operator -> QTExp (IO [ResRecord])
+runQueryL o = execOp o (\r -> [|| return (return $$(spill r)) ||])
+
+spill :: Record -> QTExp ResRecord
+spill (Record rs ss) = [|| ResRecord $$(spill2 rs) ss ||]
+
+spill2 :: [QTExp ByteString] -> QTExp [ByteString]
+spill2 [] = [|| [] ||]
+spill2 (x:xs) = [|| $$x : $$(spill2 xs) ||]
 
 test :: IO ()
 test = do
 --  processCSV "data/test.csv" (print . getField "name")
-  expr <- runQ $ unTypeQ  $ execOp (Print query) (\_ -> [|| return () ||])
+  expr <- runQ $ unTypeQ  $ execOp query (printFields . fields)
 --  expr <- runQ $ unTypeQ  $ power
   putStrLn $ pprint expr
 
