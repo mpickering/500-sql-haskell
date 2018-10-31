@@ -81,13 +81,16 @@ fix f = let x = f x in x
 
 data Scanner = Scanner ByteString
 
+runScanner (Scanner b) = b
+
 newScanner :: FilePath -> IO Scanner
 newScanner fp = Scanner <$>  B.readFile fp
 
-nextLine :: Scanner -> (ByteString, Scanner)
-nextLine (Scanner bs) =
-  let (fs, rs) = BC.span (/= '\n') bs
-  in (fs, Scanner (BC.tail rs))
+nextLine :: Code Scanner -> (Code ByteString, Code Scanner)
+nextLine s =
+  let fs = Code [|| BC.takeWhile (/= '\n') (runScanner $$(runCode s)) ||]
+      rs = Code [|| Scanner (BC.tail (BC.dropWhile (/= '\n') (runScanner $$(runCode s)))) ||]
+  in (fs, rs)
 
 hasNext :: Scanner -> Bool
 hasNext (Scanner bs) = bs /= ""
@@ -110,10 +113,9 @@ processCSV ss f yld =
     rows sch = do
       while [|| hasNext ||]
             [|| \r rs -> do
-                  let (hs, ts) = nextLine rs
-                  ($$(let fs = parseRow sch [||hs||]
-                          head_rec = yld (Record fs sch)
-                   in head_rec) >> r ts)||]
+                  $$(let (hs, ts) = nextLine (Code [|| rs ||])
+                     in [|| $$(yld (Record (parseRow sch (runCode hs)) sch))
+                              >> r $$(runCode ts) ||] ) ||]
 
     -- We can't use the standard |BC.split| function here because
     -- we we statically know how far we will unroll. The result is then
