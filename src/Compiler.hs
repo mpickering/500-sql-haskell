@@ -13,7 +13,7 @@ import Data.List
 import Data.Maybe
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax
-import Prelude hiding (Applicative(..))
+import Prelude hiding (Applicative(..), getLine, getChar)
 import qualified Prelude as P
 import Instances.TH.Lift ()
 
@@ -22,9 +22,6 @@ eq (Code e1) (Code e2) = Code [|| $$e1 == $$e2 ||]
 
 neq :: Eq a => Code a -> Code a -> Code Bool
 neq (Code e1) (Code e2) = Code [|| $$e1 /= $$e2 ||]
-
-bc_split :: Code Char -> Code ByteString -> Code [ByteString]
-bc_split (Code e1) (Code e2) = Code [|| BC.split $$e1 $$e2 ||]
 
 newtype Code a = Code (Q (TExp a))
 
@@ -47,9 +44,6 @@ data Record = Record { fields :: Fields, schema :: Schema }
 
 data ResRecord = ResRecord { fields_r :: [ByteString], schema_r :: Schema }
 
-
-
-
 getField :: ByteString -> Record -> QTExp ByteString
 getField field (Record fs sch) =
   let i = fromJust (elemIndex field sch)
@@ -70,6 +64,9 @@ query2 = Project ["name"] ["name"] (Filter (Eq (Value "34") (Field "age")) (Scan
 queryJoin :: Operator
 queryJoin = Join (Scan "data/test.csv" ["name", "age"]) (Scan "data/test1.csv" ["name", "weight"])
 
+queryProj :: Operator
+queryProj = Project ["age"] ["age"] (Scan "data/test.csv" ["name", "age"])
+
 data Predicate = Eq Ref Ref | Ne Ref Ref deriving Show
 
 data Ref = Field ByteString | Value ByteString deriving Show
@@ -78,6 +75,24 @@ type QTExp a = Q (TExp a)
 
 fix :: (a -> a) -> a
 fix f = let x = f x in x
+
+getLineS :: Scanner -> ByteString
+getLineS = getLine . runScanner
+
+getLine = getChar '\n'
+{-# NOINLINE getLine #-}
+
+getChar c s = BC.takeWhile (/= c) s
+{-# NOINLINE getChar #-}
+
+skipLine = skipChar '\n'
+skipLineS = skipCharS '\n'
+skipChar c s = BC.tail (BC.dropWhile (/= c) s)
+skipCharS c s = Scanner (skipChar c (runScanner s))
+{-# NOINLINE skipLine #-}
+{-# NOINLINE skipChar #-}
+{-# NOINLINE skipCharS #-}
+{-# NOINLINE skipLineS #-}
 
 data Scanner = Scanner ByteString
 
@@ -88,8 +103,8 @@ newScanner fp = Scanner <$>  B.readFile fp
 
 nextLine :: Code Scanner -> (Code ByteString, Code Scanner)
 nextLine s =
-  let fs = Code [|| BC.takeWhile (/= '\n') (runScanner $$(runCode s)) ||]
-      rs = Code [|| Scanner (BC.tail (BC.dropWhile (/= '\n') (runScanner $$(runCode s)))) ||]
+  let fs = Code [|| getLineS $$(runCode s) ||]
+      rs = Code [|| skipLineS $$(runCode s) ||]
   in (fs, rs)
 
 hasNext :: Scanner -> Bool
@@ -124,11 +139,11 @@ processCSV ss f yld =
     parseRow :: Schema -> QTExp ByteString -> [QTExp ByteString]
     parseRow [] _ = []
     parseRow [_] b =
-      [[|| BC.takeWhile (/= '\n') $$b ||]]
+      [[|| skipLine $$b ||]]
     parseRow (_:ss') b =
-      let new = [|| let res = BC.dropWhile (/= ',') $$b in BC.tail res ||]
+      let new = [|| skipChar ',' $$b ||]
           rs = parseRow ss' new
-      in ([|| BC.takeWhile (/= ',') $$b ||] : rs)
+      in ([|| skipChar ',' $$b ||] : rs)
 
 
 
@@ -152,9 +167,6 @@ evalRef (Field name) r = Code (getField name r)
 restrict :: Record -> Schema -> Schema -> Record
 restrict r newSchema parentSchema =
   Record (map (flip getField r) parentSchema) newSchema
-
-stringToBs :: String -> B.ByteString
-stringToBs = BC.pack
 
 -- We can unroll (==) if we statically know the length of each argument.
 _eq :: Eq a => [QTExp a] -> [QTExp a] -> QTExp Bool
@@ -181,10 +193,12 @@ execOp op yld =
 runQuery :: Operator -> QTExp Res
 runQuery q = execOp q (printFields . fields)
 
+inj :: ResRecord -> IO [ResRecord]
+inj = return . return
 
 -- We still need to eliminate the binding time abstraction
 runQueryL :: Operator -> QTExp (IO [ResRecord])
-runQueryL o = execOp o (\r -> [|| return (return $$(spill r)) ||])
+runQueryL o = execOp o (\r -> [|| inj  $$(spill r) ||])
 
 spill :: Record -> QTExp ResRecord
 spill (Record rs ss) = [|| ResRecord $$(spill2 rs) ss ||]

@@ -2,7 +2,9 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-module LMS where
+{-# LANGUAGE FlexibleInstances #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
+module StreamLMS where
 
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
@@ -17,32 +19,37 @@ import Instances.TH.Lift ()
 --import Data.FileEmbed
 import Data.Functor.Identity
 import Control.Applicative (liftA2)
-import System.IO.Unsafe
 import qualified Prelude as P
+import qualified Data.ByteString.Streaming.Char8 as Q
+import Control.Monad.Trans.Resource
 
 class Ops r where
   eq :: Eq a => r a -> r a -> r Bool
+  leq :: Eq a => r (ResIO a) -> r (ResIO a) -> r (ResIO Bool)
+  lneq :: Eq a => r (ResIO a) -> r (ResIO a) -> r (ResIO Bool)
   neq :: Eq a => r a -> r a -> r Bool
   bc_split :: r Char -> r ByteString -> r [ByteString]
-  tail_dropwhile :: Char -> r ByteString -> r ByteString
-  take_while :: Char -> r ByteString -> r ByteString
+  tail_dropwhile :: Char -> r (BS ()) -> r (BS ())
+  take_while :: Char -> r (BS ()) -> r (BS ())
 
   _if :: r Bool -> r a -> r a -> r a
-  _caseString :: r ByteString -> r a -> r a -> r a
   _fix :: (r a -> r a) -> r a
   _lam :: (r a -> r b) -> r (a -> b)
 
   _bind :: Monad m => r (m a) -> (r (a -> m b)) -> r (m b)
   _print :: Show a => r a -> r Res
-  _putStr :: r ByteString -> r Res
+  _putStr :: r (BS ())  -> r (ResIO ())
   (>>>) :: Monoid m => r m -> r m -> r m
   _empty :: Monoid m => r m
   _pure :: P.Applicative f => r a -> r (f a)
 
   -- Scanner interface
-  _newScanner :: FilePath -> r (IO Scanner)
-  _hasNext :: r Scanner -> r Bool
-  _nextLine :: r Scanner -> (r ByteString, r Scanner)
+  _newScanner :: FilePath -> r Scanner
+  _hasNext :: r Scanner -> r (ResourceT IO Bool)
+  _nextLine :: r Scanner -> (r (BS ()), r Scanner)
+
+  liftBS :: r ByteString -> r (BS ())
+  runBS :: r (BS ()) -> r (ResIO ByteString)
 
   pure :: Lift a => a -> r a
   (<*>) :: r (a -> b) -> r a -> r b
@@ -54,25 +61,26 @@ newtype Code a = Code (Q (TExp a))
 instance Ops Code where
   eq (Code e1) (Code e2) = Code [|| $$e1 == $$e2 ||]
   neq (Code e1) (Code e2) = Code [|| $$e1 /= $$e2 ||]
+  leq (Code e1) (Code e2) = Code [|| (==) <$> $$e1 P.<*> $$e2 ||]
+  lneq (Code e1) (Code e2) = Code [|| (/=) <$> $$e1 P.<*> $$e2 ||]
   bc_split (Code e1) (Code e2) = Code [|| BC.split $$e1 $$e2 ||]
   _if (Code a) (Code b) (Code c) = Code [|| if $$a then $$b else $$c ||]
-  _caseString (Code a) (Code b) (Code c) =
-    Code [|| case $$a of
-                "" -> $$b
-                _  -> $$c ||]
   (>>>) (Code a) (Code b) = Code [|| $$a <> $$b ||]
   _bind (Code a) (Code b) = Code [|| $$a >>= $$b ||]
   _empty = Code [|| mempty ||]
   _pure (Code p) = Code [|| P.pure $$p ||]
 
   _print (Code a) = Code [|| print $$a ||]
-  _putStr (Code a) = Code [|| BC.putStr $$a ||]
+  _putStr (Code a) = Code [|| Q.putStr $$a ||]
 
-  tail_dropwhile c (Code b) = Code [|| BC.tail (BC.dropWhile (/= c) $$b) ||]
-  take_while c (Code b) = Code [|| BC.takeWhile (/= c) $$b ||]
+  tail_dropwhile c (Code b) = Code [|| Q.drop 1 (Q.dropWhile (/= c) $$b) ||]
+  take_while c (Code b) = Code [|| Q.takeWhile (/= c) $$b ||]
   _fix f = Code [|| fix (\a -> $$(runCode $ f (Code [||a||]))) ||]
 
   _lam f = Code $ [|| \a ->  $$(runCode $ f (Code [|| a ||]))  ||]
+
+  liftBS (Code b) = Code $ [|| Q.fromStrict $$(b) ||]
+  runBS (Code b)  = Code $ [|| Q.toStrict_ $$b ||]
 
 
   _newScanner fp = Code [|| newScanner fp ||]
@@ -87,12 +95,15 @@ instance Ops Code where
 
 instance Ops Identity where
   eq = liftA2 (==)
+  leq = liftA2 (liftA2 (==))
+  lneq = liftA2 (liftA2 (==))
+
   neq = liftA2 (/=)
   bc_split = liftA2 (BC.split)
-  tail_dropwhile c = fmap (BC.tail . (BC.dropWhile (/= c)))
-  take_while c = fmap (BC.takeWhile (/= c))
+  tail_dropwhile c = fmap (Q.drop 1 . (Q.dropWhile (/= c)))
+  take_while c = fmap (Q.takeWhile (/= c))
   _print = fmap print
-  _putStr = fmap (BC.putStr)
+  _putStr = fmap (Q.putStr)
   _empty = Identity mempty
   _if (Identity b) (Identity c1) (Identity c2) = Identity (if b then c1 else c2)
 
@@ -105,17 +116,22 @@ instance Ops Identity where
   _hasNext = fmap hasNext
   _nextLine = nextLine
 
+  liftBS b = Q.fromStrict <$> b
+  runBS b  = Q.toStrict_ <$> b
+
   pure = Identity
   (<*>) (Identity a1) (Identity a2) = Identity (a1 a2)
 
 
-list_eq :: (Ops r, Eq a) => [r a] -> [r a] -> r Bool
-list_eq [] [] = pure True
-list_eq (v:vs) (v1:v1s) = _if (eq v v1) (list_eq vs v1s) (pure False)
-list_eq _ _ = pure False
+list_eq :: (Ops r, Eq a) => [r (ResIO a)] -> [r (ResIO a)] -> r (ResIO Bool)
+list_eq [] [] = _pure (pure True)
+list_eq (v:vs) (v1:v1s) =
+  (leq v v1) `_bind` (_lam $ \b ->
+    _if b  (list_eq vs v1s) (_pure (pure False)))
+list_eq _ _ = _pure (pure False)
 
-_when :: (Monoid m, Ops r) => r Bool -> r m -> r m
-_when cond act = _if cond act _empty
+_when :: (Monoid m, Ops r) => r (ResIO Bool) -> r (ResIO m) -> r (ResIO m)
+_when cond act = cond `_bind` (_lam $ \b -> _if b act _empty)
 
 _whenA :: (P.Applicative f, Ops r) => r Bool -> r (f ()) -> r (f ())
 _whenA cond act = _if cond act (_pure (pure ()))
@@ -125,7 +141,7 @@ runCode (Code a) = a
 
 
 
-type Fields r = [r ByteString]
+type Fields r = [r (BS ())]
 type Schema = [ByteString]
 type Table = FilePath
 
@@ -133,12 +149,12 @@ type Res = IO ()
 
 data Record r = Record { fields :: Fields r, schema :: Schema }
 
-getField :: ByteString -> Record r -> r ByteString
+getField :: ByteString -> Record r -> r (BS ())
 getField field (Record fs sch) =
   let i = fromJust (elemIndex field sch)
   in  (fs !! i)
 
-getFields :: [ByteString] -> Record r -> [r ByteString]
+getFields :: [ByteString] -> Record r -> [r (BS ())]
 getFields fs r = map (flip getField r) fs
 
 
@@ -165,43 +181,52 @@ type QTExp a = Code a
 fix :: (a -> a) -> a
 fix f = let x = f x in x
 
-data Scanner = Scanner ByteString
+data Scanner = Scanner (BS ())
 
-newScanner :: FilePath -> IO Scanner
-newScanner fp = Scanner <$>  B.readFile fp
+type BS a = Q.ByteString (ResourceT IO) a
 
-nextLine :: Identity Scanner -> (Identity ByteString, Identity Scanner)
+newScanner :: FilePath -> Scanner
+newScanner fp = Scanner (Q.readFile fp)
+
+nextLine :: Identity Scanner -> (Identity (BS ()), Identity Scanner)
 nextLine (Identity (Scanner bs)) =
-  let (fs, rs) = BC.span (/= '\n') bs
-  in (Identity fs, Identity (Scanner (BC.tail rs)))
+  (Identity $ Q.takeWhile (/= '\n') bs,
+   Identity $ Scanner (Q.drop 1 (Q.dropWhile (/= '\n') bs)))
 
 -- As |span| is not stage aware, it is more dynamic an necessary. Splitting
 -- the implementation up means that we can skip over entire rows if
 -- necessary in the generated code.
-_nextLineCode :: Code Scanner -> (Code ByteString, Code Scanner)
+_nextLineCode :: Code Scanner -> (Code (BS ()), Code Scanner)
 _nextLineCode scanner =
-  let fs = Code [|| let (Scanner s) = $$(runCode scanner) in BC.takeWhile (/= '\n') s ||]
-      ts = Code [|| let (Scanner s) = $$(runCode scanner) in Scanner (BC.tail (BC.dropWhile (/= '\n') s)) ||]
+  let fs = Code [|| let (Scanner s) = $$(runCode scanner) in Q.takeWhile (/= '\n') s ||]
+      ts = Code [|| let (Scanner s) = $$(runCode scanner) in Scanner (Q.drop 1 (Q.dropWhile (/= '\n') s)) ||]
   in (fs, ts)
 
 
 
-hasNext :: Scanner -> Bool
-hasNext (Scanner bs) = bs /= ""
+hasNext :: Scanner -> ResourceT IO Bool
+hasNext (Scanner bs) = Q.null_ bs
+
+instance Semigroup m => Semigroup (ResourceT IO m) where
+  (<>) a1 a2 = do
+    (<>) <$> a1 P.<*> a2
+
+instance Monoid m => Monoid (ResourceT IO m) where
+  mempty = P.pure mempty
 
 while ::
   (Ops r, Monoid m) =>
-  r (t -> Bool) -> r ((t -> IO m) -> t -> IO m) -> r (t -> IO m)
+  r (t -> ResIO Bool) -> r ((t -> ResIO m) -> t -> ResIO m) -> r (t -> ResIO m)
 while k b = _fix (\r -> _lam $ \rs -> _when (k <*> rs) (b <*> r <*> rs))
 
 whenM :: Monoid m => Bool -> m -> m
 whenM b act = if b then act else mempty
 
-processCSV :: forall m r . (Monoid m, Ops r) => Schema -> FilePath -> (Record r -> r (IO m)) -> r (IO m)
+processCSV :: forall m r . (Monoid m, Ops r) => Schema -> FilePath -> (Record r -> r (ResIO m)) -> r (ResIO m)
 processCSV ss f yld =
-        _newScanner f `_bind` rows ss
+    rows ss <*> _newScanner f
   where
-    rows :: Schema -> r (Scanner -> (IO m))
+    rows :: Schema -> r (Scanner -> (ResIO m))
     rows sch = do
       while (_lam _hasNext)
             (_lam $ \r -> _lam $ \rs ->
@@ -213,7 +238,7 @@ processCSV ss f yld =
     -- we we statically know how far we will unroll. The result is then
     -- more static as we can do things like drop certain fields if we
     -- perform a projection.
-    parseRow :: Schema -> r ByteString -> [r ByteString]
+    parseRow :: Schema -> r (BS ()) -> [r (BS ())]
     parseRow [] _ = []
     parseRow [_] b =
       [take_while '\n' b]
@@ -222,21 +247,21 @@ processCSV ss f yld =
           rs = parseRow ss' new
       in (take_while ',' b  : rs)
 
-printFields :: Ops r => Fields r -> r Res
+printFields :: Ops r => Fields r -> r (ResIO ())
 printFields [] = _empty
-printFields [x] = _putStr x >>> _putStr (pure "\n")
+printFields [x] = _putStr x >>> _putStr (liftBS (pure "\n"))
 printFields (x:xs) =
-  _putStr x >>> _putStr (pure ",") >>> printFields xs
+  _putStr x >>> _putStr (liftBS $ pure ",") >>> printFields xs
 
-evalPred :: Ops r => Predicate -> Record r -> r Bool
+evalPred :: Ops r => Predicate -> Record r -> r (ResIO Bool)
 evalPred  predicate rec =
   case predicate of
-    Eq a b -> eq (evalRef a rec) (evalRef b rec)
-    Ne a b -> neq (evalRef a rec) (evalRef b rec)
+    Eq a b -> leq (evalRef a rec) (evalRef b rec)
+    Ne a b -> lneq (evalRef a rec) (evalRef b rec)
 
-evalRef :: Ops r => Ref -> Record r -> r ByteString
-evalRef (Value a) _ = pure a
-evalRef (Field name) r = getField name r
+evalRef :: Ops r => Ref -> Record r -> r (ResIO ByteString)
+evalRef (Value a) _ = _pure (pure a)
+evalRef (Field name) r = runBS $ getField name r
 
 
 restrict :: Ops r => Record r -> Schema -> Schema -> Record r
@@ -244,40 +269,40 @@ restrict r newSchema parentSchema =
   Record (map (flip getField r) parentSchema) newSchema
 
 
-execOp :: (Monoid m, Ops r) => Operator -> (Record r -> r (IO m)) -> r (IO m)
+execOp :: (Monoid m, Ops r) => Operator -> (Record r -> r (ResIO m)) -> r (ResIO m)
 execOp op yld =
   case op of
     Scan file sch ->
       processCSV sch file yld
     Filter predicate parent -> execOp parent
-      (\rec -> _if (evalPred predicate rec) (yld rec) _empty )
+      (\rec -> _when (evalPred predicate rec) (yld rec) )
     Project newSchema parentSchema parent ->
       execOp parent (\rec -> yld (restrict rec newSchema parentSchema ))
     Join left right ->
       execOp left (\rec -> execOp right (\rec' ->
         let keys = schema rec `intersect` schema rec'
-        in _when (list_eq (getFields keys rec) (getFields keys rec'))
+        in _when (list_eq (map runBS $ getFields keys rec) (map runBS $ getFields keys rec'))
                (yld (Record (fields rec ++ fields rec')
                        (schema rec ++ schema rec')))))
 
 runQuery :: Operator -> Q (TExp Res)
-runQuery q = runCode $ execOp q (printFields . fields)
+runQuery q = [|| runResourceT $$(runCode $ execOp q (printFields . fields)) ||]
 
 runQueryL :: Operator -> Q (TExp (IO [Record Identity]))
-runQueryL q = runCode $ execOp q (\r -> Code [|| return (return $$(runCode $ spill r)) ||])
+runQueryL q = [|| runResourceT $$(runCode $ execOp q (\r -> Code [|| return (return $$(runCode $ spill r)) ||])) ||]
 
 spill :: Record Code -> Code (Record Identity)
 spill (Record rs ss) = Code [|| Record $$(runCode $ spill2 rs) ss ||]
 
-spill2 :: [Code ByteString] -> Code [Identity ByteString]
+spill2 :: [Code a] -> Code [Identity a]
 spill2 [] = Code [|| [] ||]
 spill2 (x:xs) = Code [|| (Identity $$(runCode x)) : $$(runCode $ spill2 xs) ||]
 
 runQueryUnstaged :: Operator -> Res
-runQueryUnstaged q = runIdentity (execOp q (printFields . fields))
+runQueryUnstaged q = runResourceT $ runIdentity (execOp q (printFields . fields))
 
 runQueryUnstagedL :: Operator -> IO [Record Identity]
-runQueryUnstagedL q = runIdentity (execOp q (return . return . return))
+runQueryUnstagedL q = runResourceT $ runIdentity (execOp q (return . return . return))
 
 test :: IO ()
 test = do
