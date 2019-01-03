@@ -22,9 +22,9 @@ library
   -- other-extensions:
   build-depends:       base >=4.10, scanner, bytestring, template-haskell
                        , th-lift-instances, file-embed, dump-core, streaming-bytestring,
-                       resourcet, weigh
+                       resourcet, weigh, streaming
   hs-source-dirs:      src
-  ghc-options: -Wall -fplugin=DumpCore
+  ghc-options: -Wall
   default-language:    Haskell2010
 
 executable test

@@ -1,5 +1,6 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# OPTIONS_GHC -ddump-splices  #-}
 module Test where
 
 --import qualified Compiler as C
@@ -10,6 +11,11 @@ import qualified StreamLMS as S
 import Weigh
 import GHC.Stats
 import System.Mem
+import System.IO
+import Data.ByteString (ByteString)
+import Control.Monad.Trans.Resource
+
+import qualified Data.ByteString.Streaming.Char8 as Q
 
 --csvQuery = L.Filter (L.Eq (L.Value "cricket") (L.Field "word")) csvTable
 
@@ -44,25 +50,28 @@ main = do
       )
       -}
 
+{-
   $$(S.runQuery S.query)
   $$(S.runQuery S.query2)
   $$(S.runQuery S.queryJoin)
+  -}
   $$(S.runQuery S.queryP)
   performGC
-  s1 <- getRTSStats
-
+--  s1 <- getRTSStats
+{-
   $$(L.runQuery L.query)
   $$(L.runQuery L.query2)
   $$(L.runQuery L.queryJoin)
   $$(L.runQuery L.queryP)
+  -}
   performGC
-  s2 <- getRTSStats
+--  s2 <- getRTSStats
 
   -- Observe that the number of max_live_bytes is much lower for the
   -- streaming version. However, the number of allocated bytes is the same
   -- for each example as we must read every character eventually.
-  print (max_live_bytes s1)
-  print (max_live_bytes s2)
+--  print (max_live_bytes s1)
+--  print (max_live_bytes s2)
 
 
 
