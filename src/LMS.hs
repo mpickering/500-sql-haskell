@@ -70,6 +70,7 @@ class Ops r where
 
   _intersect :: Eq a => r [a] -> r [a] -> r [a]
   _mkRecord :: r (Fields r1) -> r Schema -> r (Record r1)
+  _cons :: r a -> r [a] -> r [a]
 
 
 
@@ -114,6 +115,14 @@ instance Ops Code where
     Code [|| case $$r of
               Record rs ss -> $$(k1) rs ss ||]
 
+  _lup (Code l1) (Code l2) (Code l3) = Code [|| lup $$l1 $$l2 $$l3 ||]
+
+  _intersect (Code l1) (Code l2) = Code [|| $$l1 `intersect` $$l2 ||]
+
+  _mkRecord (Code l1) (Code l2) = Code [|| Record $$l1 $$l2 ||]
+
+  _cons (Code l1) (Code l2) = Code [|| $$l1 : $$l2 ||]
+
 
 instance Ops Identity where
   eq = liftA2 (==)
@@ -146,6 +155,8 @@ instance Ops Identity where
 
   _intersect = liftA2 intersect
   _mkRecord = liftA2 Record
+
+  _cons = liftA2 (:)
 
 
 
@@ -242,31 +253,43 @@ type family ResT r1 r2 :: * -> * where
   ResT Code Identity = Code
   ResT Identity r = r
 
-processCSV :: forall m r r1 . (r1 ~ Identity, Monoid m, Ops r)
+processCSV :: forall m r r1 . (Monoid m, O r1 r)
            => Schema -> FilePath -> (r1 (Record r) -> (ResT r1 r) (IO m)) -> (ResT r1 r) (IO m)
 processCSV ss f yld =
         _newScanner f `_bind` rows ss
   where
-    rows :: Schema -> r (Scanner -> (IO m))
+    rows :: Schema -> (ResT r1 r) (Scanner -> (IO m))
     rows sch = do
       while (_lam _hasNext)
             (_lam $ \r -> _lam $ \rs ->
               (let (hs, ts) = _nextLine rs
-              in yld (Identity $ Record (parseRow sch hs) sch) >>> (r <*> ts))
+                   rec = _mkRecord (parseRow sch hs) (pure sch)
+              in yld rec  >>> (r <*> ts))
               )
 
     -- We can't use the standard |BC.split| function here because
     -- we we statically know how far we will unroll. The result is then
     -- more static as we can do things like drop certain fields if we
     -- perform a projection.
-    parseRow :: Schema -> r ByteString -> [r ByteString]
-    parseRow [] _ = []
+    parseRow :: Schema -> (ResT r1 r) ByteString -> r1 [r ByteString]
+    parseRow [] _ = _empty
     parseRow [_] b =
-      [take_while '\n' b]
+      weaken (take_while '\n' b) `_cons` _empty
     parseRow (_:ss') b =
       let new = tail_dropwhile ',' b
           rs = parseRow ss' new
-      in (take_while ',' b  : rs)
+      in weaken (take_while ',' b)  `_cons` rs
+
+class Weaken r1 r where
+  weaken :: (ResT r1 r) a -> r1 (r a)
+
+instance Weaken Code Identity where
+  weaken (Code c) = Code [|| Identity $$c ||]
+
+instance Weaken Identity i where
+  weaken i = Identity i
+
+
 
 printFields :: Ops r => Fields r -> r Res
 printFields [] = _empty
@@ -286,7 +309,8 @@ instance Collapse Code Identity where
 type O r1 r = (Collapse r1 r
                           , Ops r
                           , Ops (ResT r1 r)
-                          , Ops r1)
+                          , Ops r1
+                          , Weaken r1 r)
 
 evalPred :: forall r1 r . (O r1 r)
          => Predicate -> r1 (Record r) -> (ResT r1 r) Bool
@@ -306,12 +330,12 @@ evalRef (Field name) r = c $ getField (pure name) r
 class O r1 r => ListEq (s :: Symbol) r r1 where
   list_eq :: (Eq a) => r1 [r a] -> r1 [r a] -> (ResT r1 r) Bool
 
-class Ops r => Restrict (s :: Symbol) r r1 where
+class O r1 r => Restrict (s :: Symbol) r r1 where
   restrict :: Ops r => r1 (Record r) -> Schema -> Schema -> r1 (Record r)
 
 instance Ops r => Restrict "unrolled" r Identity where
   restrict r newSchema parentSchema =
-    let ns = map Identity newSchema
+    let ns = map Identity parentSchema
         nfs = sequence $ map (flip getField r) ns
     in Record <$> nfs <*> Identity newSchema
 --    Record <$> (map (flip getField r) parentSchema) <*> _
@@ -340,8 +364,8 @@ instance ListEq "recursive" Code Identity where
 -- if r = Identity then r1 = Code or Identity
 -- Having two type parameters means that we can either choose to use a
 -- continuation which statically knows the argument (r1 = Identity) or not.
-execOp :: forall restrict le r r1 m . (r1 ~ Identity
-                                      , Restrict restrict r r1
+execOp :: forall restrict le r r1 m . (
+                                        Restrict restrict r r1
                                       , ListEq le r r1
                                       , Monoid m
                                       , Ops r
@@ -371,7 +395,9 @@ execOp op yld =
 _fields r = _case_record r (_lam $ \fs -> _lam $ \_ -> fs)
 _schema r = _case_record r (_lam $ \_  -> _lam $ \ss -> ss)
 
-execOpU :: forall r r1 m . (Monoid m, Ops r, r1 ~ Identity)
+execOpU :: forall r r1 m . (Monoid m, O r r1
+                           , Restrict "unrolled" r r1
+                           , ListEq "unrolled" r r1)
         => Operator
         -> (r1 (Record r) -> (ResT r1 r) (IO m))
         -> (ResT r1 r) (IO m)
