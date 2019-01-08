@@ -10,6 +10,9 @@
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE ConstraintKinds #-}
 module LMS where
 
 import qualified Data.ByteString as B
@@ -28,6 +31,7 @@ import Control.Applicative (liftA2)
 import System.IO.Unsafe
 import qualified Prelude as P
 import GHC.TypeLits
+import Control.Applicative (liftA3)
 
 
 
@@ -57,6 +61,17 @@ class Ops r where
 
   pure :: Lift a => a -> r a
   (<*>) :: r (a -> b) -> r a -> r b
+
+  _case_record :: r (Record r1)
+               -> r ((Fields r1) -> Schema -> c)
+               -> r c
+
+  _lup :: r ByteString -> r (Fields r1) -> r Schema -> r (r1 ByteString)
+
+  _intersect :: Eq a => r [a] -> r [a] -> r [a]
+  _mkRecord :: r (Fields r1) -> r Schema -> r (Record r1)
+
+
 
 infixl 4 <*>
 
@@ -95,6 +110,10 @@ instance Ops Code where
   pure = Code . unsafeTExpCoerce . lift
   (Code f) <*> (Code a) = Code [|| $$f $$a ||]
 
+  _case_record (Code r) (Code k1) =
+    Code [|| case $$r of
+              Record rs ss -> $$(k1) rs ss ||]
+
 
 instance Ops Identity where
   eq = liftA2 (==)
@@ -119,6 +138,15 @@ instance Ops Identity where
   pure = Identity
   (<*>) (Identity a1) (Identity a2) = Identity (a1 a2)
 
+  _case_record (Identity r) (Identity k) =
+    case r of
+      Record rs ss -> Identity (k rs ss)
+
+  _lup = liftA3 lup
+
+  _intersect = liftA2 intersect
+  _mkRecord = liftA2 Record
+
 
 
 _when :: (Monoid m, Ops r) => r Bool -> r m -> r m
@@ -140,13 +168,18 @@ type Res = IO ()
 
 data Record r = Record { fields :: Fields r, schema :: Schema }
 
-getField :: ByteString -> Record r -> r ByteString
-getField field (Record fs sch) =
+getField :: Ops r1 => r1 ByteString -> r1 (Record r) -> r1 (r ByteString)
+getField field r =
+  _case_record r (_lam $ \fs -> _lam $ \sch -> _lup field fs sch)
+
+
+lup :: ByteString -> Fields r -> Schema -> r ByteString
+lup field fs sch =
   let i = fromJust (elemIndex field sch)
   in  (fs !! i)
 
-getFields :: [ByteString] -> Record r -> [r ByteString]
-getFields fs r = map (flip getField r) fs
+--getFields :: [ByteString] -> Record r -> [r ByteString]
+--getFields fs r = map (flip getField r) fs
 
 
 data Operator = Scan FilePath Schema | Project Schema Schema Operator
@@ -204,7 +237,13 @@ while k b = _fix (\r -> _lam $ \rs -> _when (k <*> rs) (b <*> r <*> rs))
 whenM :: Monoid m => Bool -> m -> m
 whenM b act = if b then act else mempty
 
-processCSV :: forall m r . (Monoid m, Ops r) => Schema -> FilePath -> (Record r -> r (IO m)) -> r (IO m)
+type family ResT r1 r2 :: * -> * where
+  ResT Identity Code = Code
+  ResT Code Identity = Code
+  ResT Identity r = r
+
+processCSV :: forall m r r1 . (r1 ~ Identity, Monoid m, Ops r)
+           => Schema -> FilePath -> (r1 (Record r) -> (ResT r1 r) (IO m)) -> (ResT r1 r) (IO m)
 processCSV ss f yld =
         _newScanner f `_bind` rows ss
   where
@@ -213,7 +252,7 @@ processCSV ss f yld =
       while (_lam _hasNext)
             (_lam $ \r -> _lam $ \rs ->
               (let (hs, ts) = _nextLine rs
-              in yld (Record (parseRow sch hs) sch) >>> (r <*> ts))
+              in yld (Identity $ Record (parseRow sch hs) sch) >>> (r <*> ts))
               )
 
     -- We can't use the standard |BC.split| function here because
@@ -235,74 +274,114 @@ printFields [x] = _putStr x >>> _putStr (pure "\n")
 printFields (x:xs) =
   _putStr x >>> _putStr (pure ",") >>> printFields xs
 
-evalPred :: Ops r => Predicate -> Record r -> r Bool
+class Collapse r1 r2 where
+  c :: r1 (r2 a) -> (ResT r1 r2) a
+
+instance Collapse Identity r where
+  c (Identity a) = a
+
+instance Collapse Code Identity where
+  c (Code c) = Code [|| runIdentity $$c ||]
+
+type O r1 r = (Collapse r1 r
+                          , Ops r
+                          , Ops (ResT r1 r)
+                          , Ops r1)
+
+evalPred :: forall r1 r . (O r1 r)
+         => Predicate -> r1 (Record r) -> (ResT r1 r) Bool
 evalPred  predicate rec =
   case predicate of
     Eq a b -> eq (evalRef a rec) (evalRef b rec)
     Ne a b -> neq (evalRef a rec) (evalRef b rec)
 
-evalRef :: Ops r => Ref -> Record r -> r ByteString
+evalRef :: (Collapse r1 r
+           , Ops r
+           , Ops (ResT r1 r)
+           , Ops r1 ) => Ref -> r1 (Record r) -> (ResT r1 r) ByteString
 evalRef (Value a) _ = pure a
-evalRef (Field name) r = getField name r
+evalRef (Field name) r = c $ getField (pure name) r
 
 
-class Ops r => ListEq (s :: Symbol) r where
-  list_eq :: (Eq a) => [r a] -> [r a] -> r Bool
+class O r1 r => ListEq (s :: Symbol) r r1 where
+  list_eq :: (Eq a) => r1 [r a] -> r1 [r a] -> (ResT r1 r) Bool
 
-class Ops r => Restrict (s :: Symbol) r where
-  restrict :: Ops r => Record r -> Schema -> Schema -> Record r
+class Ops r => Restrict (s :: Symbol) r r1 where
+  restrict :: Ops r => r1 (Record r) -> Schema -> Schema -> r1 (Record r)
 
-instance Ops r => Restrict "unrolled" r where
+instance Ops r => Restrict "unrolled" r Identity where
   restrict r newSchema parentSchema =
-    Record (map (flip getField r) parentSchema) newSchema
+    let ns = map Identity newSchema
+        nfs = sequence $ map (flip getField r) ns
+    in Record <$> nfs <*> Identity newSchema
+--    Record <$> (map (flip getField r) parentSchema) <*> _
 
-instance Ops r => ListEq "unrolled" r where
-  list_eq :: (Eq a) => [r a] -> [r a] -> r Bool
-  list_eq [] [] = pure True
-  list_eq (v:vs) (v1:v1s) = _if (eq v v1) (list_eq @"unrolled" vs v1s) (pure False)
+instance Ops r => ListEq "unrolled" r Identity where
+  list_eq :: (Eq a) => Identity [r a] -> Identity [r a] -> r Bool
+  list_eq (Identity []) (Identity []) = pure True
+  list_eq (Identity (v:vs)) (Identity (v1:v1s))
+    = _if (eq v v1) (list_eq @"unrolled" (Identity vs) (Identity v1s)) (pure False)
   list_eq _ _ = pure False
 
-instance ListEq "recursive" Identity where
-  list_eq :: (Eq a) => [Identity a] -> [Identity a] -> Identity Bool
+instance ListEq "recursive" Identity Identity where
+  list_eq :: (Eq a) => Identity [Identity a] -> Identity [Identity a] -> Identity Bool
   list_eq xs ys = Identity (xs == ys)
 
 pull :: [Code a] -> Code [a]
 pull [] = Code [|| [] ||]
 pull (x:xs) = Code [|| $$(runCode x) : $$(runCode $ pull xs) ||]
 
-instance ListEq "recursive" Code where
-  list_eq :: (Eq a) => [Code a] -> [Code a] -> Code Bool
-  list_eq xs ys = Code [|| $$(runCode $ pull xs) == $$(runCode $ pull ys) ||]
+instance ListEq "recursive" Code Identity where
+  list_eq :: (Eq a) => Identity [Code a] -> Identity [Code a] -> Code Bool
+  list_eq (Identity xs) (Identity ys) = Code [|| $$(runCode $ pull xs) == $$(runCode $ pull ys) ||]
 
 
-
-execOp :: forall restrict le r m . (Restrict restrict r, ListEq le r, Monoid m, Ops r) => Operator -> (Record r -> r (IO m)) -> r (IO m)
+-- if r = Code then r1 = Identity
+-- if r = Identity then r1 = Code or Identity
+-- Having two type parameters means that we can either choose to use a
+-- continuation which statically knows the argument (r1 = Identity) or not.
+execOp :: forall restrict le r r1 m . (r1 ~ Identity
+                                      , Restrict restrict r r1
+                                      , ListEq le r r1
+                                      , Monoid m
+                                      , Ops r
+                                      , Ops r1)
+                                      => Operator
+                                      -> (r1 (Record r) -> (ResT r1 r) (IO m))
+                                      -> (ResT r1 r) (IO m)
 execOp op yld =
   case op of
     Scan file sch ->
       processCSV sch file yld
     Filter predicate parent -> execOp @restrict @le parent
-      (\rec -> _if (evalPred predicate rec) (yld rec) _empty )
+      (\rec -> _if (evalPred @r1 @r predicate rec) (yld rec) _empty )
     Project newSchema parentSchema parent ->
       execOp @restrict @le parent (\rec -> yld (restrict @restrict rec newSchema parentSchema ))
     Join left right ->
       execOp @restrict @le left (\rec -> execOp @restrict @le right (\rec' ->
-        let keys = schema rec `intersect` schema rec'
-        in _when (list_eq @le (getFields keys rec) (getFields keys rec'))
-               (yld (Record (fields rec ++ fields rec')
-                       (schema rec ++ schema rec')))))
+        let k1 = _schema rec
+            k2 = _fields rec
+            keys = _intersect (_schema rec) (_schema rec')
+            leq = list_eq @le @r @r1 @ByteString k2 (_fields rec')
+        in _when leq
+               (yld (_mkRecord (_fields rec >>> _fields rec')
+                               (_schema rec >>> _schema rec')
+                       ))))
 
-execOpU :: forall r m . (Monoid m, Ops r)
+_fields r = _case_record r (_lam $ \fs -> _lam $ \_ -> fs)
+_schema r = _case_record r (_lam $ \_  -> _lam $ \ss -> ss)
+
+execOpU :: forall r r1 m . (Monoid m, Ops r, r1 ~ Identity)
         => Operator
-        -> (Record r -> r (IO m))
-        -> r (IO m)
+        -> (r1 (Record r) -> (ResT r1 r) (IO m))
+        -> (ResT r1 r) (IO m)
 execOpU = execOp @"unrolled" @"unrolled"
 
 runQuery :: Operator -> Q (TExp Res)
-runQuery q = runCode $ execOpU q (printFields . fields)
+runQuery q = runCode $ execOpU q (printFields . fields . runIdentity)
 
 runQueryL :: Operator -> Q (TExp (IO [Record Identity]))
-runQueryL q = runCode $ execOpU q (\r -> Code [|| return (return $$(runCode $ spill r)) ||])
+runQueryL q = runCode $ execOpU q (\r -> Code [|| return (return $$(runCode $ spill (runIdentity r))) ||])
 
 spill :: Record Code -> Code (Record Identity)
 spill (Record rs ss) = Code [|| Record $$(runCode $ spill2 rs) ss ||]
@@ -312,17 +391,18 @@ spill2 [] = Code [|| [] ||]
 spill2 (x:xs) = Code [|| (Identity $$(runCode x)) : $$(runCode $ spill2 xs) ||]
 
 runQueryUnstaged :: Operator -> Res
-runQueryUnstaged q = runIdentity (execOpU q (printFields . fields))
+runQueryUnstaged q = runIdentity (execOpU q (printFields . fields . runIdentity))
 
 runQueryUnstagedL :: Operator -> IO [Record Identity]
-runQueryUnstagedL q = runIdentity (execOpU q (return . return . return))
+runQueryUnstagedL q = runIdentity (execOpU @Identity @Identity q (return . return . return . runIdentity))
 
 test :: IO ()
 test = do
 --  processCSV "data/test.csv" (print . getField "name")
-  expr <- runQ $ unTypeQ  $ runCode $ execOpU query (printFields . fields)
+  --expr <- runQ $ unTypeQ  $ runCode $ execOpU query (printFields . fields)
 --  expr <- runQ $ unTypeQ  $ power
-  putStrLn $ pprint expr
+  --putStrLn $ pprint expr
+  print ""
 
 
 bsToExp :: B.ByteString -> Q Exp
