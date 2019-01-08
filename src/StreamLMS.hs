@@ -3,6 +3,7 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE Strict #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 module StreamLMS where
 
@@ -200,7 +201,7 @@ type BS a = Q.ByteString IO a
 
 newScanner :: FilePath -> IO Scanner
 newScanner fp =
-  openFile fp ReadMode >>= \h -> return (Scanner (Q.fromHandle h))
+  openBinaryFile fp ReadMode >>= \h -> return (Scanner (Q.fromHandle h))
 
 nextLine :: Identity Scanner -> (Identity (BS ()), Identity Scanner)
 nextLine (Identity (Scanner bs)) =
@@ -221,12 +222,6 @@ _nextLineCode scanner =
 hasNext :: Scanner -> IO (Of Bool Scanner)
 hasNext (Scanner bs) = (\(b :> s) -> (not b :> Scanner s)) <$> Q.testNull bs
 
-instance Semigroup m => Semigroup (ResourceT IO m) where
-  (<>) a1 a2 = do
-    (<>) <$> a1 P.<*> a2
-
-instance Monoid m => Monoid (ResourceT IO m) where
-  mempty = P.pure mempty
 
 while ::
   (Ops r, Monoid m) =>
