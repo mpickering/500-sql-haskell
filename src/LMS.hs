@@ -13,6 +13,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DeriveLift #-}
 module LMS where
 
 import qualified Data.ByteString as B
@@ -33,6 +34,15 @@ import qualified Prelude as P
 import GHC.TypeLits
 import Control.Applicative (liftA3)
 
+import Instances.TH.Lift
+
+import Criterion
+import Criterion.Main
+import System.IO.Silently
+import System.Mem
+import Debug.Trace
+
+for = flip map
 
 
 class Ops r where
@@ -194,22 +204,22 @@ lup field fs sch =
 
 
 data Operator = Scan FilePath Schema | Project Schema Schema Operator
-              | Filter Predicate Operator | Join Operator Operator deriving Show
+              | Filter Predicate Operator | Join Operator Operator deriving (Lift, Show)
 
-query, query2 :: Operator
-query = Project ["age"] ["age"] (Filter (Eq (Value "john") (Field "name")) (Scan "data/test.csv" ["name", "age"]))
+query, query2 :: FilePath -> Operator
+query fp = Project ["age"] ["age"] (Filter (Eq (Value "john") (Field "name")) (Scan fp ["name", "age"]))
 
-query2 = Project ["name"] ["name"] (Filter (Eq (Value "34") (Field "age")) (Scan "data/test.csv" ["name", "age"]))
+query2 fp = Project ["name"] ["name"] (Filter (Eq (Value "34") (Field "age")) (Scan fp ["name", "age"]))
 
-queryJoin :: Operator
-queryJoin = Join (Scan "data/test.csv" ["name", "age"]) (Scan "data/test1.csv" ["name", "weight"])
+queryJoin :: FilePath -> Operator
+queryJoin fp = Join (Scan fp ["name", "age"]) (Scan fp ["name", "weight"])
 
-queryP :: Operator
-queryP = Project ["name"] ["name"] (Scan "data/test.csv" ["name", "age"])
+queryP :: FilePath -> Operator
+queryP fp = Project ["name"] ["name"] (Scan fp ["name", "age"])
 
-data Predicate = Eq Ref Ref | Ne Ref Ref deriving Show
+data Predicate = Eq Ref Ref | Ne Ref Ref deriving (Show, Lift)
 
-data Ref = Field ByteString | Value ByteString deriving Show
+data Ref = Field ByteString | Value ByteString deriving (Show, Lift)
 
 type QTExp a = Code a
 
@@ -219,7 +229,7 @@ fix f = let x = f x in x
 data Scanner = Scanner ByteString
 
 newScanner :: FilePath -> IO Scanner
-newScanner fp = Scanner <$>  B.readFile fp
+newScanner fp = Scanner <$> B.readFile fp
 
 nextLine :: Identity Scanner -> (Identity ByteString, Identity Scanner)
 nextLine (Identity (Scanner bs)) =
@@ -333,12 +343,51 @@ class O r1 r => ListEq (s :: Symbol) r r1 where
 class O r1 r => Restrict (s :: Symbol) r r1 where
   restrict :: Ops r => r1 (Record r) -> Schema -> Schema -> r1 (Record r)
 
+
+-- Point of this instance is that we can use the normal `map` in order to
+-- get the value of each field at
 instance Ops r => Restrict "unrolled" r Identity where
   restrict r newSchema parentSchema =
     let ns = map Identity parentSchema
         nfs = sequence $ map (flip getField r) ns
     in Record <$> nfs <*> Identity newSchema
 --    Record <$> (map (flip getField r) parentSchema) <*> _
+
+-- In this instance we lost the static information about
+instance Restrict "recursive" Identity Code where
+  restrict :: Code (Record Identity) -> Schema -> Schema -> Code (Record Identity)
+  restrict rec news ps =
+    let ns = map pure ps
+        r = map (flip getField rec) ns
+    in Code [|| Record $$(runCode $ spillL r) ps ||]
+
+-- In this instance we just do the same as the unrolled version because
+-- that's already recursive so err, that's good I guess.
+--
+-- Can't really think how to make this totally suck now because the problem
+-- is that we have to maintain the staticness of the schema so we can't
+-- really weaken.
+instance Restrict "recursive" Code Identity where
+  restrict :: Identity (Record Code) -> Schema -> Schema -> Identity (Record Code)
+  restrict (Identity rec) new ps =
+    let fs = fields rec
+        fs' = map (getField2 fs ps) (map pure ps)
+        getField' = getField2
+    in Identity (Record fs' new)
+
+getField2 :: Fields Code -> Schema -> Code ByteString ->  Code ByteString
+getField2 fields ps lup_field =
+  Code [|| runIdentity $ lup $$(runCode lup_field) $$(runCode $ spill2 fields) ps ||]
+
+
+-- One of my favourite functions <3
+spillL :: [Code a] -> Code [a]
+spillL [] = Code [|| [] ||]
+spillL (x:xs) = Code [|| $$(runCode x) : $$(runCode $ spillL xs) ||]
+
+spillQ :: [Q (TExp a)] -> Q (TExp [a])
+spillQ [] = [|| [] ||]
+spillQ (x:xs) = [|| $$x : $$(spillQ xs) ||]
 
 instance Ops r => ListEq "unrolled" r Identity where
   list_eq :: (Eq a) => Identity [r a] -> Identity [r a] -> r Bool
@@ -350,6 +399,11 @@ instance Ops r => ListEq "unrolled" r Identity where
 instance ListEq "recursive" Identity Identity where
   list_eq :: (Eq a) => Identity [Identity a] -> Identity [Identity a] -> Identity Bool
   list_eq xs ys = Identity (xs == ys)
+
+instance ListEq "recursive" Identity Code where
+  list_eq :: Eq a => Code [Identity a] -> Code [Identity a] -> Code Bool
+  list_eq (Code xs) (Code ys) = Code [|| $$(xs) == $$(ys) ||]
+
 
 pull :: [Code a] -> Code [a]
 pull [] = Code [|| [] ||]
@@ -403,8 +457,63 @@ execOpU :: forall r r1 m . (Monoid m, O r r1
         -> (ResT r1 r) (IO m)
 execOpU = execOp @"unrolled" @"unrolled"
 
+-- r1 = Identity; r = Code
 runQuery :: Operator -> Q (TExp Res)
 runQuery q = runCode $ execOpU q (printFields . fields . runIdentity)
+
+-- r = Identity; r1 = Identity
+runQueryUnstaged :: Operator -> Res
+runQueryUnstaged q =
+  --traceShow q
+  runIdentity (execOpU q (printFields . fields . runIdentity))
+
+runQueryUnstagedC :: Operator -> Q (TExp Res)
+runQueryUnstagedC q = [|| runQueryUnstaged q ||]
+
+-- Unrolled le, rec r
+runQueryUR :: Operator -> Q (TExp Res)
+runQueryUR q =
+  runCode $ execOp @"unrolled" @"recursive" q (printFields . fields . runIdentity)
+
+-- Rec le, unrolled r
+runQueryRU :: Operator -> Q (TExp Res)
+runQueryRU q =
+  runCode $ execOp @"recursive" @"unrolled" q (printFields . fields . runIdentity)
+
+-- Rec le, rec r
+runQueryRR :: Operator -> Q (TExp Res)
+runQueryRR q = runCode $ execOp @"recursive" @"recursive" q (printFields . fields . runIdentity)
+
+-- r1 = Code; r = Identity
+-- If r1 = Code then we can't use the unrolled versions as we don't know
+-- the schema. We can only unroll the loop.
+runQueryDynamic :: Operator -> Q (TExp Res)
+runQueryDynamic q = runCode (execOp @"recursive" @"recursive" @Identity @Code q printFields17)
+
+queries = [ ("query", query)
+          --, ("query2", query2)
+          --, ("queryJoin", queryJoin)
+          , ("queryP", queryP)]
+
+runners = [ ("best", runQuery)
+          , ("unstaged", runQueryUnstagedC)
+          , ("ur", runQueryUR)
+          , ("ru", runQueryRU)
+          , ("rr", runQueryRR)
+          , ("dynamic", runQueryDynamic)
+          ]
+
+files = ["data/data-" ++ show (10^n) ++ ".csv" | n <- [0..5] ]
+
+genBench :: Q (TExp [Benchmark])
+genBench =
+  spillQ $ for runners $ \(name, r) ->
+    [|| bgroup name $$(spillQ $ for queries $ \(qname, q) ->
+        [|| bgroup qname $ $$(spillQ $ for files $ \fn ->
+          [|| let b = $$(r (q fn)) in bench fn $ perBatchEnv (const performGC) (\() -> silence b) ||]) ||]) ||]
+
+printFields17 :: Code (Record Identity) -> Code (IO ())
+printFields17 (Code c) = Code [|| runIdentity $ printFields (fields $$(c)) ||]
 
 runQueryL :: Operator -> Q (TExp (IO [Record Identity]))
 runQueryL q = runCode $ execOpU q (\r -> Code [|| return (return $$(runCode $ spill (runIdentity r))) ||])
@@ -416,8 +525,6 @@ spill2 :: [Code ByteString] -> Code [Identity ByteString]
 spill2 [] = Code [|| [] ||]
 spill2 (x:xs) = Code [|| (Identity $$(runCode x)) : $$(runCode $ spill2 xs) ||]
 
-runQueryUnstaged :: Operator -> Res
-runQueryUnstaged q = runIdentity (execOpU q (printFields . fields . runIdentity))
 
 runQueryUnstagedL :: Operator -> IO [Record Identity]
 runQueryUnstagedL q = runIdentity (execOpU @Identity @Identity q (return . return . return . runIdentity))

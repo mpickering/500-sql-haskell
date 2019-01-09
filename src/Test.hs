@@ -28,8 +28,14 @@ import System.IO.Silently
 
 --csvTable = L.Scan ["word", "year", "n1" "n2"] "1gram.csv"
 
+
+for = flip map
+
 main :: IO ()
 main = do
+  defaultMain $
+    $$(L.genBench)
+
   {-
   putStrLn "Simple Interpreter"
   SI.runQuery SI.query
@@ -70,12 +76,14 @@ main = do
     , bench "q" $ whnfIO (silence $ StI.runQuery StI.queryP)
     ]]
     ++  -}
+  {-
   defaultMain $
     [bgroup "LMS-C" [
     bench "q" $ whnfIO (silence $$(S.runQuery S.query))
     , bench "q2" $ whnfIO (silence $$(S.runQuery S.query2))
     , bench "qj" $ whnfIO (silence $$(S.runQuery S.queryJoin))
     , bench "qp" $ whnfIO (silence $$(S.runQuery S.queryP)) ]]
+    -}
 
 {-
   $$(L.runQuery L.query)
