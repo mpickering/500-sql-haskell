@@ -41,6 +41,7 @@ import Criterion.Main
 import System.IO.Silently
 import System.Mem
 import Debug.Trace
+import System.IO
 
 for = flip map
 
@@ -60,6 +61,7 @@ class Ops r where
   _bind :: Monad m => r (m a) -> (r (a -> m b)) -> r (m b)
   _print :: Show a => r a -> r Res
   _putStr :: r ByteString -> r Res
+  _hPutStr :: r Handle -> r ByteString -> r Res
   (>>>) :: Monoid m => r m -> r m -> r m
   _empty :: Monoid m => r m
   _pure :: P.Applicative f => r a -> r (f a)
@@ -104,6 +106,7 @@ instance Ops Code where
 
   _print (Code a) = Code [|| print $$a ||]
   _putStr (Code a) = Code [|| BC.putStr $$a ||]
+  _hPutStr (Code a) (Code b) = Code [|| BC.hPutStr $$a $$b ||]
 
   tail_dropwhile c (Code b) = Code [|| BC.tail (BC.dropWhile (/= c) $$b) ||]
   take_while c (Code b) = Code [|| BC.takeWhile (/= c) $$b ||]
@@ -142,6 +145,7 @@ instance Ops Identity where
   take_while c = fmap (BC.takeWhile (/= c))
   _print = fmap print
   _putStr = fmap (BC.putStr)
+  _hPutStr = liftA2 BC.hPut
   _empty = Identity mempty
   _if (Identity b) (Identity c1) (Identity c2) = Identity (if b then c1 else c2)
 
@@ -206,16 +210,28 @@ lup field fs sch =
 data Operator = Scan FilePath Schema | Project Schema Schema Operator
               | Filter Predicate Operator | Join Operator Operator deriving (Lift, Show)
 
-query, query2 :: FilePath -> Operator
-query fp = Project ["age"] ["age"] (Filter (Eq (Value "john") (Field "name")) (Scan fp ["name", "age"]))
+cols n = take (2 ^ n) [BC.pack('f':show n) | n <- [0..]]
 
-query2 fp = Project ["name"] ["name"] (Filter (Eq (Value "34") (Field "age")) (Scan fp ["name", "age"]))
+fp c n = "data/data-" ++ show (10^n) ++ "-" ++ show (2 ^ c) ++ ".csv"
 
-queryJoin :: FilePath -> Operator
-queryJoin fp = Join (Scan fp ["name", "age"]) (Scan fp ["name", "weight"])
 
-queryP :: FilePath -> Operator
-queryP fp = Project ["name"] ["name"] (Scan fp ["name", "age"])
+queryP, queryJoin, queryLast, query, query2 :: Int -> Int -> Operator
+query c n  =
+  Project ["f0"] ["f0"] (Filter (Eq (Value "a") (Field "f0"))
+  (Scan (fp c n) (cols c)))
+
+
+query2 c n = Project ["f0"] ["f0"] (Filter (Eq (Value "a") (Field "f0"))
+              (Scan (fp c n) (cols c)))
+
+queryJoin c n = Join (Scan (fp c n) (cols c)) (Scan (fp c n) (cols c))
+
+queryP c n = Project ["f0"] ["f0"] (Scan (fp c n) (cols c))
+
+queryLast c n =
+  let cs = cols c
+  in Project [last cs] [last cs] (Scan (fp c n) cs)
+
 
 data Predicate = Eq Ref Ref | Ne Ref Ref deriving (Show, Lift)
 
@@ -301,11 +317,11 @@ instance Weaken Identity i where
 
 
 
-printFields :: Ops r => Fields r -> r Res
-printFields [] = _empty
-printFields [x] = _putStr x >>> _putStr (pure "\n")
-printFields (x:xs) =
-  _putStr x >>> _putStr (pure ",") >>> printFields xs
+printFields :: Ops r => r Handle -> Fields r -> r Res
+printFields _ [] = _empty
+printFields h [x] = _hPutStr h x >>> _hPutStr h (pure "\n")
+printFields h (x:xs) =
+  _hPutStr h x >>> _hPutStr h (pure ",") >>> printFields h xs
 
 class Collapse r1 r2 where
   c :: r1 (r2 a) -> (ResT r1 r2) a
@@ -346,12 +362,21 @@ class O r1 r => Restrict (s :: Symbol) r r1 where
 
 -- Point of this instance is that we can use the normal `map` in order to
 -- get the value of each field at
-instance Ops r => Restrict "unrolled" r Identity where
-  restrict r newSchema parentSchema =
+instance Restrict "unrolled" Code Identity where
+  restrict r newSchema parentSchema
+    | length parentSchema <= 10 =
     let ns = map Identity parentSchema
         nfs = sequence $ map (flip getField r) ns
     in Record <$> nfs <*> Identity newSchema
+  restrict r newSchema parentSchema =
+    restrict @"recursive" r newSchema parentSchema
 --    Record <$> (map (flip getField r) parentSchema) <*> _
+
+instance Restrict s Identity Identity where
+  restrict rec newSchema parentSchema =
+    let ns = map Identity parentSchema
+        r = map (runIdentity . flip getField rec) ns
+    in Identity $ Record r parentSchema
 
 -- In this instance we lost the static information about
 instance Restrict "recursive" Identity Code where
@@ -389,14 +414,22 @@ spillQ :: [Q (TExp a)] -> Q (TExp [a])
 spillQ [] = [|| [] ||]
 spillQ (x:xs) = [|| $$x : $$(spillQ xs) ||]
 
-instance Ops r => ListEq "unrolled" r Identity where
-  list_eq :: (Eq a) => Identity [r a] -> Identity [r a] -> r Bool
-  list_eq (Identity []) (Identity []) = pure True
-  list_eq (Identity (v:vs)) (Identity (v1:v1s))
-    = _if (eq v v1) (list_eq @"unrolled" (Identity vs) (Identity v1s)) (pure False)
-  list_eq _ _ = pure False
+instance ListEq "unrolled" Code Identity where
+  list_eq :: (Eq a) => Identity [Code a] -> Identity [Code a] -> Code Bool
+  list_eq (Identity xs) (Identity ys) =
+    let lxs = length xs
+        lys = length ys
+    in if max lxs lys <= 10
+         then list_eq_r xs ys
+         else list_eq @"recursive" (Identity xs) (Identity ys)
 
-instance ListEq "recursive" Identity Identity where
+
+list_eq_r [] [] = pure True
+list_eq_r (v:vs) (v1:v1s)
+  = _if (eq v v1) (list_eq_r vs v1s) (pure False)
+list_eq_r _ _ = pure False
+
+instance ListEq s Identity Identity where
   list_eq :: (Eq a) => Identity [Identity a] -> Identity [Identity a] -> Identity Bool
   list_eq xs ys = Identity (xs == ys)
 
@@ -415,6 +448,7 @@ instance ListEq "recursive" Code Identity where
 
 
 -- if r = Code then r1 = Identity
+--
 -- if r = Identity then r1 = Code or Identity
 -- Having two type parameters means that we can either choose to use a
 -- continuation which statically knows the argument (r1 = Identity) or not.
@@ -457,66 +491,85 @@ execOpU :: forall r r1 m . (Monoid m, O r r1
         -> (ResT r1 r) (IO m)
 execOpU = execOp @"unrolled" @"unrolled"
 
+print_k h =
+    (\r -> Code [|| $$(runCode $ printFields h (fields (runIdentity r))) ||])
+
+
+wrap :: Code (Handle -> IO ()) -> Code (IO ())
+wrap (Code c) =
+  Code [|| withFile "/dev/null" WriteMode $$c ||]
+
 -- r1 = Identity; r = Code
-runQuery :: Operator -> Q (TExp Res)
-runQuery q = runCode $ execOpU q (printFields . fields . runIdentity)
+runQuery :: Operator -> Q (TExp ( Res))
+runQuery q =
+  runCode $
+    wrap (Code [|| \h -> $$(runCode $ execOpU q (print_k (Code [|| h ||]))) ||])
 
 -- r = Identity; r1 = Identity
-runQueryUnstaged :: Operator -> Res
+runQueryUnstaged :: Operator -> ( Res)
 runQueryUnstaged q =
   --traceShow q
-  runIdentity (execOpU q (printFields . fields . runIdentity))
+  withFile "/dev/null" WriteMode (\handle ->
+  runIdentity (execOpU q
+    (\r -> Identity (
+              runIdentity (printFields (Identity handle) (fields (runIdentity r)))))))
 
-runQueryUnstagedC :: Operator -> Q (TExp Res)
+runQueryUnstagedC :: Operator -> Q (TExp ( Res))
 runQueryUnstagedC q = [|| runQueryUnstaged q ||]
 
 -- Unrolled le, rec r
-runQueryUR :: Operator -> Q (TExp Res)
+runQueryUR :: Operator -> Q (TExp ( Res))
 runQueryUR q =
-  runCode $ execOp @"unrolled" @"recursive" q (printFields . fields . runIdentity)
+  runCode $
+    wrap (Code [|| \h -> $$(runCode $ execOp @"unrolled" @"recursive" q (print_k (Code [|| h ||]))) ||])
 
 -- Rec le, unrolled r
-runQueryRU :: Operator -> Q (TExp Res)
+runQueryRU :: Operator -> Q (TExp ( Res))
 runQueryRU q =
-  runCode $ execOp @"recursive" @"unrolled" q (printFields . fields . runIdentity)
+  runCode $
+    wrap (_lam $ \h -> execOp @"recursive" @"unrolled" q (print_k h))
 
 -- Rec le, rec r
-runQueryRR :: Operator -> Q (TExp Res)
-runQueryRR q = runCode $ execOp @"recursive" @"recursive" q (printFields . fields . runIdentity)
+runQueryRR :: Operator -> Q (TExp ( Res))
+runQueryRR q =
+  runCode $
+    wrap (_lam $ \h -> execOp @"recursive" @"recursive" q (print_k h))
 
 -- r1 = Code; r = Identity
 -- If r1 = Code then we can't use the unrolled versions as we don't know
 -- the schema. We can only unroll the loop.
-runQueryDynamic :: Operator -> Q (TExp Res)
-runQueryDynamic q = runCode (execOp @"recursive" @"recursive" @Identity @Code q printFields17)
+runQueryDynamic :: Operator -> Q (TExp ( Res))
+runQueryDynamic q =
+  runCode (
+    wrap (_lam $ \h -> execOp @"recursive" @"recursive" @Identity @Code q (printFields17 h)))
 
-queries = [ ("query", query)
+queries = [ --("query", query)
           --, ("query2", query2)
-          --, ("queryJoin", queryJoin)
-          , ("queryP", queryP)]
+          --("queryJoin", queryJoin)
+          ("queryP", queryP)
+          , ("queryLast", queryLast)]
 
 runners = [ ("best", runQuery)
-          , ("unstaged", runQueryUnstagedC)
           , ("ur", runQueryUR)
           , ("ru", runQueryRU)
           , ("rr", runQueryRR)
           , ("dynamic", runQueryDynamic)
+          , ("unstaged", runQueryUnstagedC)
           ]
 
-files = ["data/data-" ++ show (10^n) ++ ".csv" | n <- [0..5] ]
+files = [(n, c)
+        | n <- [3..3], c <- [1..3] ]
 
 genBench :: Q (TExp [Benchmark])
 genBench =
   spillQ $ for runners $ \(name, r) ->
     [|| bgroup name $$(spillQ $ for queries $ \(qname, q) ->
-        [|| bgroup qname $ $$(spillQ $ for files $ \fn ->
-          [|| let b = $$(r (q fn)) in bench fn $ perBatchEnv (const performGC) (\() -> silence b) ||]) ||]) ||]
+        [|| bgroup qname $ $$(spillQ $ for files $ \(n, c) ->
+          [|| let b = $$(r (q c n)) in bench $$(runCode $ pure $ fp c n) $ perBatchEnv (const performGC) (\() -> b) ||]) ||]) ||]
 
-printFields17 :: Code (Record Identity) -> Code (IO ())
-printFields17 (Code c) = Code [|| runIdentity $ printFields (fields $$(c)) ||]
-
-runQueryL :: Operator -> Q (TExp (IO [Record Identity]))
-runQueryL q = runCode $ execOpU q (\r -> Code [|| return (return $$(runCode $ spill (runIdentity r))) ||])
+printFields17 :: (Code Handle) -> Code (Record Identity) -> Code (IO ())
+printFields17 (Code h) (Code c) =
+      Code [|| runIdentity $ printFields (Identity $$h) (fields $$(c)) ||]
 
 spill :: Record Code -> Code (Record Identity)
 spill (Record rs ss) = Code [|| Record $$(runCode $ spill2 rs) ss ||]
